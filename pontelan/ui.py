@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from pontelan import __version__ as VERSION
+from pontelan.latency import format_rtt
 
 COLORS = {
     "porcelain": "#F5F6F8", "paper": "#FFFFFF", "inset": "#F5F6F9",
@@ -192,13 +193,18 @@ class PeerRow(QFrame):
         if state == "connected":
             detail = "Conexão direta" if route else "Conexão estabelecida"
             if isinstance(latency, (int, float)):
-                detail += f" · {round(latency)} ms"
+                detail += " · " + format_rtt(latency)
         else:
             detail = {"connecting": "Negociando a rota entre os computadores…",
                       "disconnected": "O jogador saiu da sessão.",
                       "failed": "Não foi possível estabelecer uma rota."}.get(state, "")
         self.detail_label.setText(detail)
         self.detail_label.setToolTip(f"Rota ICE: {route}" if route else "")
+        if state == "connected" and peer.get("rtt_p50_ms") is not None:
+            self.detail_label.setToolTip(
+                f"RTT do aplicativo · último {format_rtt(latency)}\n"
+                f"Mediana {format_rtt(peer.get('rtt_p50_ms'))} · p95 {format_rtt(peer.get('rtt_p95_ms'))}\n"
+                f"Rota ICE: {route}")
 
 
 class MainWindow(QMainWindow):
@@ -1079,7 +1085,7 @@ class MainWindow(QMainWindow):
             received = int(event.get("received") or 0)
             self.footer_label.setText(f"Enviado {_format_bytes(sent)}  ·  recebido {_format_bytes(received)}")
             latency = event.get("rtt_ms")
-            self.latency_label.setText(f"{round(latency)} ms" if isinstance(latency, (int, float)) else "")
+            self.latency_label.setText(format_rtt(latency) if isinstance(latency, (int, float)) else "")
         elif kind == "worlds":
             self.world_combo.blockSignals(True)
             self.world_combo.clear()

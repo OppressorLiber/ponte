@@ -168,6 +168,8 @@ class NetworkTests(UpdateFixture, unittest.IsolatedAsyncioTestCase):
         for _, kwargs in session.requests:
             self.assertFalse(kwargs["allow_redirects"])
             self.assertFalse(kwargs["auto_decompress"])
+            self.assertEqual(kwargs["max_line_size"], 65536)
+            self.assertEqual(kwargs["max_field_size"], 65536)
             self.assertNotIn("ssl", kwargs)
             self.assertNotIn("Authorization", kwargs["headers"])
             self.assertIsNotNone(kwargs["timeout"].total)

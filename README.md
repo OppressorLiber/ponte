@@ -19,7 +19,11 @@ A partir da versão **0.2.0**, o Ponte verifica automaticamente o GitHub ao inic
 
 O arquivo recebido precisa corresponder a um manifesto assinado com Ed25519, ao tamanho informado e ao SHA-256. Um processo separado troca o executável, preserva preferências e confirma que a nova versão iniciou; se a inicialização falhar, restaura a versão anterior. Não há token do GitHub dentro do aplicativo.
 
-Quem ainda usa **0.1.0** precisa baixar a **0.2.0** uma vez, pois aquela primeira versão não contém o atualizador.
+Quem ainda usa **0.1.0** precisa baixar a versão mais recente uma vez, pois aquela primeira versão não contém o atualizador.
+
+### Indicador de latência
+
+A versão **0.2.1** usa relógio de alta precisão. Valores menores que um milissegundo aparecem como `<1 ms`; amostras antigas deixam de ser apresentadas como atuais. O número mede a ida e volta do aplicativo, incluindo filas e processamento, e pode variar sem causar travadas no jogo. Passe o mouse sobre a latência de um participante para ver mediana e p95; o diagnóstico inclui o histórico recente, timeouts de sondas e atraso do loop local. Timeout de uma sonda não representa uma porcentagem de perda de pacotes da rede.
 
 ## Como a conexão funciona
 

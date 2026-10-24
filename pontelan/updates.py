@@ -165,7 +165,8 @@ async def _response(
 ) -> AsyncIterator[aiohttp.ClientResponse]:
     for redirect in range(6):
         _validate_url(url, hosts)
-        async with session.get(url, allow_redirects=False, timeout=timeout, headers=_HEADERS, auto_decompress=False) as response:
+        async with session.get(url, allow_redirects=False, timeout=timeout, headers=_HEADERS,
+                               auto_decompress=False, max_line_size=65536, max_field_size=65536) as response:
             if response.status in (301, 302, 303, 307, 308):
                 location = response.headers.get("Location")
                 if not location or redirect == 5:

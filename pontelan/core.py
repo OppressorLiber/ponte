@@ -15,6 +15,7 @@ from collections.abc import Callable
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 
 from .signaling import SignalBus, new_code, normalize_code
+from .latency import LatencySamples, summary
 
 LOG = logging.getLogger(__name__)
 CHUNK = 16384
@@ -212,15 +213,19 @@ class TunnelPeer:
         self.ready = asyncio.Event()
         self.closed = False
         self.rtt_ms = None
-        self.pings = {}
+        self.latency = LatencySamples()
         self.ping_task = None
         self.connect_task = None
         self.pc.on("datachannel", self._datachannel)
         self.pc.on("connectionstatechange", self._state)
 
     def notify(self, state):
+        self.rtt_ms = self.latency.latest()
+        stats = self.latency.diagnostics()
         self.owner.emit({"type": "peer", "peer_id": self.peer_id, "name": self.name,
-                         "state": state, "rtt_ms": self.rtt_ms, "route": self.route()})
+                         "state": state, "rtt_ms": self.rtt_ms, "route": self.route(),
+                         "rtt_p50_ms": stats["p50_ms"], "rtt_p95_ms": stats["p95_ms"],
+                         "rtt_sample_age": stats["sample_age_seconds"]})
 
     def route(self):
         try:
@@ -281,9 +286,9 @@ class TunnelPeer:
             if data.get("type") == "ping" and isinstance(data.get("id"), str):
                 self.control.send(json.dumps({"type": "pong", "id": data["id"]}))
             elif data.get("type") == "pong":
-                start = self.pings.pop(data.get("id"), None)
-                if start is not None:
-                    self.rtt_ms = round((time.monotonic() - start) * 1000, 1)
+                value = self.latency.pong(data.get("id"))
+                if value is not None:
+                    self.rtt_ms = round(value, 2)
                     self.notify("connected")
         except (ValueError, TypeError, ConnectionError):
             return
@@ -292,7 +297,7 @@ class TunnelPeer:
         try:
             while not self.closed and self.control.readyState == "open":
                 ping_id = uuid.uuid4().hex[:12]
-                self.pings = {ping_id: time.monotonic()}
+                self.latency.probe(ping_id)
                 self.control.send(json.dumps({"type": "ping", "id": ping_id}))
                 await asyncio.sleep(3)
         except (asyncio.CancelledError, ConnectionError):
@@ -364,9 +369,20 @@ class TunnelService:
         self.sent = self.received = 0
         self.stopping = False
         self.metrics_task = None
+        self.loop_lag_task = None
+        self.loop_lag = deque(maxlen=120)
         self.tasks = set()
         self.generation = 0
         self.starting = False
+
+    async def _measure_loop(self):
+        try:
+            while True:
+                start = time.perf_counter()
+                await asyncio.sleep(.5)
+                self.loop_lag.append(max(0, (time.perf_counter() - start - .5) * 1000))
+        except asyncio.CancelledError:
+            pass
 
     def _begin(self):
         if self.bus or self.starting:
@@ -374,6 +390,7 @@ class TunnelService:
         self.generation += 1
         self.starting = True
         self.stopping = False
+        self.loop_lag.clear()
         return self.generation
 
     def _check_start(self, generation):
@@ -430,6 +447,7 @@ class TunnelService:
         self.emit({"type": "room", "code": self.code, "name": self.name, "port": port})
         self.emit({"type": "status", "state": "hosting", "role": "host", "message": "Sala aberta. Convide seus amigos."})
         self.metrics_task = asyncio.create_task(self._metrics())
+        self.loop_lag_task = asyncio.create_task(self._measure_loop())
         return self.code
 
     async def join(self, code, port=0, name="Amigo"):
@@ -458,6 +476,7 @@ class TunnelService:
             self._check_start(generation)
             peer.connect_task = asyncio.create_task(peer.wait_connected())
             self.metrics_task = asyncio.create_task(self._metrics())
+            self.loop_lag_task = asyncio.create_task(self._measure_loop())
             self.starting = False
         except BaseException:
             if generation == self.generation:
@@ -532,11 +551,23 @@ class TunnelService:
             asyncio.create_task(self.stop())
 
     async def _metrics(self):
+        previous_sent, previous_received, previous_time = self.sent, self.received, time.perf_counter()
         try:
             while True:
-                rtts = [p.rtt_ms for p in self.peers.values() if p.rtt_ms is not None]
+                now = time.perf_counter()
+                elapsed = max(.001, now - previous_time)
+                rtts = []
+                for peer in list(self.peers.values()):
+                    latest = peer.latency.latest()
+                    if latest is not None:
+                        rtts.append(latest)
+                    if latest != peer.rtt_ms and peer.ready.is_set() and not peer.closed:
+                        peer.notify("connected")
                 self.emit({"type": "metrics", "sent": self.sent, "received": self.received,
-                           "rtt_ms": round(sum(rtts) / len(rtts), 1) if rtts else None})
+                           "sent_bytes_sec": round((self.sent - previous_sent) / elapsed),
+                           "received_bytes_sec": round((self.received - previous_received) / elapsed),
+                           "rtt_ms": round(max(rtts), 2) if rtts else None})
+                previous_sent, previous_received, previous_time = self.sent, self.received, now
                 await asyncio.sleep(2)
         except asyncio.CancelledError:
             pass
@@ -563,6 +594,10 @@ class TunnelService:
             self.metrics_task.cancel()
             await asyncio.gather(self.metrics_task, return_exceptions=True)
             self.metrics_task = None
+        if self.loop_lag_task:
+            self.loop_lag_task.cancel()
+            await asyncio.gather(self.loop_lag_task, return_exceptions=True)
+            self.loop_lag_task = None
         if self.bus:
             bus, self.bus = self.bus, None
             await bus.close()
@@ -570,8 +605,13 @@ class TunnelService:
         self.emit({"type": "status", "state": "stopped", "message": "Conexão encerrada.", "role": self.role})
 
     def diagnostics(self):
-        return {"version": "0.1.0", "role": self.role, "active": bool(self.bus),
+        from . import __version__
+        return {"version": __version__, "role": self.role, "active": bool(self.bus),
                 "sent": self.sent, "received": self.received,
-                "peers": [{"state": p.pc.connectionState, "route": p.route(), "rtt_ms": p.rtt_ms,
-                           "streams": len(p.streams)} for p in self.peers.values()],
+                "event_loop_lag": summary(self.loop_lag),
+                "peers": [{"state": p.pc.connectionState, "route": p.route(), "rtt_ms": p.latency.latest(),
+                           "latency": p.latency.diagnostics(), "streams": len(p.streams),
+                           "buffered_bytes": sum(s.channel.bufferedAmount for s in p.streams),
+                           "receive_queued_bytes": sum(s.queued_bytes for s in p.streams),
+                           "send_unacked_bytes": sum(WINDOW - s.credit for s in p.streams)} for p in self.peers.values()],
                 "transport": "WebRTC / ICE / STUN; sem TURN", "signaling": self.endpoint}

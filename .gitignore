@@ -18,5 +18,6 @@ qa-*.json
 assets/preview-*.png
 docs/plano.md
 Ponte-0.1.0.spec
+qa_latency_ab.py
 *.exe
 *.zip
