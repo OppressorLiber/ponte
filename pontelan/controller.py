@@ -7,6 +7,7 @@ import logging
 import os
 import platform
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 from .core import TunnelService
 from .discovery import discover
 from .update_manager import UpdateManager
+from .event_loop import NetworkEventLoop
 
 
 class Controller(QObject):
@@ -27,6 +29,8 @@ class Controller(QObject):
         self.updater = None
         self.update_task = None
         self.pending_update_idle = False
+        self.last_spike_capture = 0
+        self.spike_capture_index = 0
         self.started = threading.Event()
         self.thread = threading.Thread(target=self._run, name="Ponte-rede", daemon=True)
         self.thread.start()
@@ -34,7 +38,7 @@ class Controller(QObject):
             raise RuntimeError("Não foi possível iniciar a rede do Ponte.")
 
     def _run(self):
-        self.loop = asyncio.SelectorEventLoop()
+        self.loop = NetworkEventLoop()
         asyncio.set_event_loop(self.loop)
         self.service = TunnelService(self._service_event)
         self.updater = UpdateManager(self.event.emit, lambda:
@@ -50,6 +54,22 @@ class Controller(QObject):
 
     def _service_event(self, event):
         self.event.emit(event)
+        rtt = event.get("rtt_ms")
+        if (event.get("type") == "peer" and isinstance(rtt, (int, float)) and rtt >= 250
+                and self.service and self.service.bus and time.perf_counter() - self.last_spike_capture >= 30):
+            self.last_spike_capture = time.perf_counter()
+            self.spike_capture_index = (self.spike_capture_index + 1) % 3
+            snapshot = self.service.diagnostics()
+            snapshot["trigger"] = "RTT de aplicativo >= 250 ms; contexto de pico, não diagnóstico conclusivo"
+            folder = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Ponte" / "Diagnosticos"
+            path = folder / f"Ponte-pico-{self.spike_capture_index}.json"
+            async def save_spike():
+                try:
+                    folder.mkdir(parents=True, exist_ok=True)
+                    await asyncio.to_thread(path.write_text, json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+                except OSError:
+                    logging.getLogger(__name__).warning("Não foi possível salvar o contexto de um pico de latência")
+            asyncio.create_task(save_spike())
         if event.get("type") == "status" and event.get("state") == "stopped" and self.updater:
             self.pending_update_idle = True
             self._schedule_update(self.updater.idle())

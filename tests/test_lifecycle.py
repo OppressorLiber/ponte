@@ -275,9 +275,10 @@ class FlowControlTests(unittest.IsolatedAsyncioTestCase):
         await self._send_until_credit_returned([b"x"] * 129, 128, 1)
 
     async def test_sender_waits_for_byte_credit_and_resumes_after_ack(self):
-        frames = core.WINDOW // core.CHUNK
-        await self._send_until_credit_returned(
-            [b"x" * core.CHUNK] * (frames + 1), frames, core.CHUNK)
+        frames = core.WINDOW // core.SEND_CHUNK
+        with patch.object(core, 'PEER_SEND_BUDGET', core.WINDOW):
+            await self._send_until_credit_returned(
+                [b"x" * core.SEND_CHUNK] * (frames + 1), frames, core.SEND_CHUNK)
 
 
 if __name__ == "__main__":

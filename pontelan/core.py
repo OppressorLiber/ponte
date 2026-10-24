@@ -16,9 +16,12 @@ from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSession
 
 from .signaling import SignalBus, new_code, normalize_code
 from .latency import LatencySamples, summary
+from .flow import DeliveryWindow
 
 LOG = logging.getLogger(__name__)
 CHUNK = 16384
+SEND_CHUNK = 4096
+PEER_SEND_BUDGET = 131072
 WINDOW = 262144
 MAX_PEERS = 8
 MAX_STREAMS = 32
@@ -48,6 +51,9 @@ class StreamBridge:
         self.credit_changed = asyncio.Event()
         self.credit = WINDOW
         self.pending_sizes = deque()
+        self.pending_times = deque()
+        if not hasattr(peer, "delivery"):
+            peer.delivery = DeliveryWindow(PEER_SEND_BUDGET, quantum=SEND_CHUNK)
         self.queued_bytes = 0
         self.queued_frames = 0
         self.eof_acked = asyncio.Event()
@@ -80,6 +86,9 @@ class StreamBridge:
                 self.close()
                 return
             self.pending_sizes.popleft()
+            if self.pending_times:
+                sent_at = self.pending_times.popleft()
+                self.peer.delivery.release(self, count, time.perf_counter() - sent_at)
             self.credit += count
             self.credit_changed.set()
             return
@@ -139,7 +148,7 @@ class StreamBridge:
 
     async def _read(self):
         while not self.closed:
-            data = await self.reader.read(CHUNK)
+            data = await self.reader.read(SEND_CHUNK)
             if not data:
                 self.sent_eof = True
                 self.channel.send(b"\x01")
@@ -150,12 +159,17 @@ class StreamBridge:
                 if self.closed:
                     return
                 await self.credit_changed.wait()
+            await self.peer.delivery.acquire(self, len(data))
+            if self.closed or self.channel.readyState != "open":
+                self.peer.delivery.release(self, len(data))
+                return
             self.credit -= len(data)
             self.pending_sizes.append(len(data))
-            if self.closed or self.channel.readyState != "open":
-                return
+            self.pending_times.append(time.perf_counter())
             self.channel.send(b"\x00" + data)
             self.peer.owner.sent += len(data)
+            # Give small requests, credit replies and other TCP flows a turn.
+            await asyncio.sleep(0)
 
     async def _write(self):
         while not self.closed:
@@ -192,6 +206,7 @@ class StreamBridge:
         if self.closed:
             return
         self.closed = True
+        self.peer.delivery.forget(self)
         self.opened.set()
         self.credit_changed.set()
         self.eof_acked.set()
@@ -210,6 +225,7 @@ class TunnelPeer:
         self.pc = RTCPeerConnection(configuration)
         self.control = None
         self.streams = set()
+        self.delivery = DeliveryWindow(PEER_SEND_BUDGET, quantum=SEND_CHUNK)
         self.ready = asyncio.Event()
         self.closed = False
         self.rtt_ms = None
@@ -345,6 +361,7 @@ class TunnelPeer:
         self.closed = True
         for stream in list(self.streams):
             stream.close()
+        self.delivery.close()
         for task in (self.ping_task, self.connect_task):
             if task and task is not asyncio.current_task():
                 task.cancel()
@@ -611,6 +628,7 @@ class TunnelService:
                 "event_loop_lag": summary(self.loop_lag),
                 "peers": [{"state": p.pc.connectionState, "route": p.route(), "rtt_ms": p.latency.latest(),
                            "latency": p.latency.diagnostics(), "streams": len(p.streams),
+                           "delivery": p.delivery.diagnostics(),
                            "buffered_bytes": sum(s.channel.bufferedAmount for s in p.streams),
                            "receive_queued_bytes": sum(s.queued_bytes for s in p.streams),
                            "send_unacked_bytes": sum(WINDOW - s.credit for s in p.streams)} for p in self.peers.values()],

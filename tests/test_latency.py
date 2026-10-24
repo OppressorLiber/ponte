@@ -51,6 +51,7 @@ class LatencyTests(unittest.TestCase):
 
     def test_diagnostics_do_not_present_expired_rtt_as_current(self):
         from pontelan.core import TunnelService
+        from pontelan.flow import DeliveryWindow
         now = [1.0]
         samples = LatencySamples(clock=lambda: now[0])
         samples.probe('a')
@@ -60,7 +61,7 @@ class LatencyTests(unittest.TestCase):
         service = TunnelService(lambda e: None)
         service.peers['test'] = SimpleNamespace(
             pc=SimpleNamespace(connectionState='connected'), route=lambda: 'host ↔ host',
-            rtt_ms=50, latency=samples, streams=set())
+            rtt_ms=50, latency=samples, streams=set(), delivery=DeliveryWindow())
         self.assertIsNone(service.diagnostics()['peers'][0]['rtt_ms'])
 
 

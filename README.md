@@ -25,6 +25,23 @@ Quem ainda usa **0.1.0** precisa baixar a versão mais recente uma vez, pois aqu
 
 A versão **0.2.1** usa relógio de alta precisão. Valores menores que um milissegundo aparecem como `<1 ms`; amostras antigas deixam de ser apresentadas como atuais. O número mede a ida e volta do aplicativo, incluindo filas e processamento, e pode variar sem causar travadas no jogo. Passe o mouse sobre a latência de um participante para ver mediana e p95; o diagnóstico inclui o histórico recente, timeouts de sondas e atraso do loop local. Timeout de uma sonda não representa uma porcentagem de perda de pacotes da rede.
 
+### Transporte sob carga — 0.2.2
+
+Esta versão muda o envio dos dados do jogo. Há uma fila compartilhada com admissão justa entre os fluxos TCP, orçamento adaptativo de bytes aguardando confirmação e blocos de envio de 4 KiB. Créditos e encerramento continuam confiáveis. O protocolo de recepção aceita os blocos das versões anteriores; recomendamos atualizar os dois PCs para melhorar o envio nos dois sentidos.
+
+O objetivo é reduzir o acúmulo de dados que faz pedidos pequenos esperarem atrás de transferências grandes. O loop de rede também usa relógio preciso para os prazos do transporte. Picos a partir de 250 ms geram até três diagnósticos locais rotativos, sem convite, nomes, SDP ou IP remoto, para investigar a sessão real.
+
+Uma comparação controlada com TCP, ICE, DTLS e SCTP reais, upload/download concorrentes e pedidos TCP de 64 bytes mostrou:
+
+| Caminho simulado | p95 anterior sob carga | p95 novo sob carga |
+|---|---:|---:|
+| 2 Mbit/s por sentido, RTT 40 ms | 3.078 ms | 850 ms |
+| 20 Mbit/s por sentido, RTT 100 ms | 1.377 ms | 856 ms |
+
+São médias dos percentis de duas repetições por cenário, em ordem alternada, com 16 MB conferidos por SHA-256 e 442 respostas de teste íntegras. No caminho lento a vazão aumentou; no rápido o upload médio caiu cerca de 14% e o download cerca de 12%. É uma troca em favor de menor espera sob carga, não uma promessa de aumentar a velocidade máxima em toda rede. O relatório bruto acompanha a release. O teste usa um caminho moldado no mesmo PC e não substitui a validação entre as casas dos jogadores.
+
+Para reproduzir: `python qa_transport.py --repetitions 2 --bulk-bytes 1000000 --candidate-window 131072 --output qa-transport.json`.
+
 ## Como a conexão funciona
 
 WebRTC DataChannels confiáveis e ordenados transportam os bytes do TCP com criptografia DTLS. ICE/STUN tentam estabelecer o caminho direto, sem abrir portas manualmente no roteador. Não há TURN ou retransmissão da partida. Algumas combinações de NAT/firewall podem impedir a conexão direta.
