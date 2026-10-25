@@ -8,10 +8,21 @@ Baixe **Ponte.exe** na [versão mais recente](https://github.com/OppressorLiber/
 
 1. O anfitrião abre seu mundo e escolhe **Abrir para LAN** no Minecraft.
 2. No Ponte, informa a porta exibida no chat e cria um convite.
-3. O amigo abre o Ponte, entra com o convite e copia o endereço local apresentado.
-4. No Minecraft do amigo: **Multijogador → Conexão direta → colar endereço**.
+3. O amigo abre o Ponte, informa seu nome e pede entrada com o convite.
+4. O anfitrião aprova a primeira solicitação e pode confiar naquele computador para liberar as próximas entradas automaticamente.
+5. O amigo copia o endereço local e usa **Multijogador → Conexão direta → colar endereço** no Minecraft.
 
 Mantenha o jogo e o Ponte abertos durante a partida. Os jogadores precisam usar versões e modpacks compatíveis entre si. O túnel transporta uma porta TCP do jogo; mods que usam portas adicionais podem exigir suporte próprio. Esta ferramenta não altera saves, mods, launcher ou contas.
+
+## Controle da sala — 0.2.4
+
+O anfitrião aprova ou recusa solicitações antes de liberar o túnel para o mundo. Ao aprovar, pode marcar **Confiar neste computador**; também pode confiar em alguém que já está conectado. Computadores de confiança entram automaticamente nas próximas salas quando apresentam um convite válido. A lista fica salva no computador do anfitrião e pode ser gerenciada e revogada.
+
+A confiança é verificada por uma chave Ed25519 persistente do computador do convidado, que assina a oferta vinculada ao convite, à tentativa e ao SDP. Copiar o nome ou ter o convite não permite se passar por um computador já confiável. Nomes continuam sendo informados pelos participantes e não substituem a identidade da conta Minecraft. Solicitações desconhecidas expiram após dois minutos.
+
+**Remover** encerra a conexão daquela pessoa e retira a confiança do computador. Para voltar, ela precisa pedir entrada e receber uma nova aprovação. **Renovar convite** invalida o convite anterior para novas entradas e mantém os participantes já conectados; solicitações e negociações ainda incompletas são canceladas. Se o serviço não conseguir preparar o novo convite, o anterior continua funcionando.
+
+Atualize os dois PCs para receber os novos estados de espera. Veja [Controle da sala](docs/salas.md). A integração automática por mod Forge foi estudada e está descrita em [Mod Forge](docs/mod-forge.md); o mod ainda não faz parte desta versão.
 
 ## Atualizações
 

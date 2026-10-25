@@ -12,12 +12,15 @@ import uuid
 from collections import deque
 from collections.abc import Callable
 
-from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCConfiguration, RTCIceServer, RTCSessionDescription
+from aiortc.sdp import SessionDescription
 
 from .signaling import SignalBus, new_code, normalize_code
 from .latency import LatencySamples, summary
 from .flow import DeliveryWindow
 from .send_buffer import SendBuffer
+from .rtc import RoomPeerConnection as RTCPeerConnection
+from .identity import Identity, TrustStore, verify_offer
 
 LOG = logging.getLogger(__name__)
 CHUNK = 16384
@@ -25,6 +28,9 @@ SEND_CHUNK = 4096
 PEER_SEND_BUDGET = 131072
 WINDOW = 262144
 MAX_PEERS = 8
+MAX_PENDING = 8
+MAX_REQUEST_IDS = 1000
+APPROVAL_TIMEOUT = 120
 MAX_STREAMS = 32
 STUN = "stun:stun.cloudflare.com:3478"
 
@@ -39,6 +45,21 @@ def direct_description(sdp: str) -> str:
 
 def safe_name(name: str) -> str:
     return "".join(c for c in str(name) if c.isprintable())[:60].strip() or "Meu mundo"
+
+
+def admission_description(sdp):
+    sdp = direct_description(sdp)
+    try:
+        description = SessionDescription.parse(sdp)
+        if not sdp.startswith("v=0") or len(description.media) != 1:
+            raise ValueError()
+        media = description.media[0]
+        if (media.kind != "application" or not media.sctp_port or not media.ice.usernameFragment
+                or not media.ice.password or not media.dtls or not media.dtls.fingerprints):
+            raise ValueError()
+    except (ValueError, AssertionError, IndexError, AttributeError, KeyError) as exc:
+        raise ValueError("Descrição do pedido de entrada inválida.") from exc
+    return sdp
 
 
 def outgoing_buffered(peer):
@@ -127,12 +148,14 @@ class StreamBridge:
         pumps = []
         try:
             await asyncio.wait_for(self.opened.wait(), 20)
-            if self.closed:
+            if self.closed or self.peer.closed or getattr(self.peer.owner, "stopping", False):
                 return
             if self.reader is None:
                 self.reader, self.writer = await asyncio.wait_for(
                     asyncio.open_connection("127.0.0.1", host_port), 5
                 )
+            if self.closed or self.peer.closed or getattr(self.peer.owner, "stopping", False):
+                return
             pumps = [asyncio.create_task(self._read()), asyncio.create_task(self._write())]
             await asyncio.gather(*pumps)
             # aiortc's stream reset can overtake messages still in its application
@@ -241,11 +264,15 @@ class TunnelPeer:
         self.delivery = DeliveryWindow(PEER_SEND_BUDGET, quantum=SEND_CHUNK)
         self.send_buffer = SendBuffer(lambda: outgoing_buffered(self))
         self.ready = asyncio.Event()
+        self.answer_received = asyncio.Event()
         self.closed = False
         self.rtt_ms = None
         self.latency = LatencySamples()
         self.ping_task = None
         self.connect_task = None
+        self.negotiation_task = None
+        self.public_key = None
+        self.fingerprint = ""
         self.pc.on("datachannel", self._datachannel)
         self.pc.on("connectionstatechange", self._state)
 
@@ -254,6 +281,8 @@ class TunnelPeer:
         stats = self.latency.diagnostics()
         self.owner.emit({"type": "peer", "peer_id": self.peer_id, "name": self.name,
                          "state": state, "rtt_ms": self.rtt_ms, "route": self.route(),
+                         "fingerprint": self.fingerprint, "can_trust": bool(self.public_key),
+                         "trusted": self.owner._is_trusted(self.public_key, self.fingerprint),
                          "rtt_p50_ms": stats["p50_ms"], "rtt_p95_ms": stats["p95_ms"],
                          "rtt_sample_age": stats["sample_age_seconds"]})
 
@@ -281,6 +310,9 @@ class TunnelPeer:
             await self.owner.stop()
 
     def _datachannel(self, channel):
+        if self.closed or self.owner.stopping:
+            channel.close()
+            return
         if channel.label == "control" and self.control is None:
             self._control(channel)
         elif (self.owner.role == "host" and re.fullmatch(r"tcp:[a-f0-9]{32}", channel.label)
@@ -351,6 +383,10 @@ class TunnelPeer:
 
     async def wait_connected(self):
         try:
+            if self.owner.role == "guest":
+                # A decision at the end of the approval window can still need
+                # ICE gathering and a signaling POST before its answer arrives.
+                await asyncio.wait_for(self.answer_received.wait(), APPROVAL_TIMEOUT + 45)
             await asyncio.wait_for(self.ready.wait(), 40)
             if self.closed:
                 return
@@ -358,7 +394,9 @@ class TunnelPeer:
             self.notify("failed")
             if self.owner.role == "guest":
                 self.owner.emit({"type": "error", "message":
-                    "Não foi possível criar o caminho direto. Confira o convite, o mundo aberto e a rede."})
+                    ("O pedido de entrada expirou. Entre novamente para enviar outro pedido."
+                     if not self.answer_received.is_set() else
+                     "Não foi possível criar o caminho direto. Confira o convite, o mundo aberto e a rede.")})
                 asyncio.create_task(self.owner.stop())
             await self.close()
 
@@ -374,6 +412,9 @@ class TunnelPeer:
 
     async def close(self):
         if self.closed:
+            closing = getattr(self.pc, "_room_close_task", None)
+            if closing is not None:
+                await asyncio.shield(closing)
             return
         self.closed = True
         for stream in list(self.streams):
@@ -382,7 +423,7 @@ class TunnelPeer:
             stream.close()
         self.delivery.close()
         self.send_buffer.close()
-        for task in (self.ping_task, self.connect_task):
+        for task in (self.ping_task, self.connect_task, self.negotiation_task):
             if task and task is not asyncio.current_task():
                 task.cancel()
         await self.pc.close()
@@ -392,7 +433,8 @@ class TunnelPeer:
 
 
 class TunnelService:
-    def __init__(self, emit: Callable[[dict], None], *, endpoint="https://ntfy.sh", stun=True):
+    def __init__(self, emit: Callable[[dict], None], *, endpoint="https://ntfy.sh", stun=True,
+                 identity=None, trust_store=None):
         self.emit = emit
         self.endpoint, self.stun = endpoint, stun
         self.bus = None
@@ -411,6 +453,18 @@ class TunnelService:
         self.tasks = set()
         self.generation = 0
         self.starting = False
+        self.pending_requests = {}
+        self.request_ids = set()
+        self.room_lock = asyncio.Lock()
+        self.renew_task = None
+        self.replacement_bus = None
+        self.retired_buses = set()
+        self.waiting_approval = False
+        self.stop_task = None
+        self.identity = identity
+        self.trust_store = trust_store if trust_store is not None else TrustStore()
+        self.revoked_fingerprints = set()
+        self.trust_read_failed = False
 
     async def _measure_loop(self):
         try:
@@ -422,11 +476,14 @@ class TunnelService:
             pass
 
     def _begin(self):
+        if self.stop_task and not self.stop_task.done():
+            raise ValueError("Aguarde o encerramento da conexão atual.")
         if self.bus or self.starting:
             raise ValueError("Encerre a conexão atual antes de iniciar outra.")
         self.generation += 1
         self.starting = True
         self.stopping = False
+        self.stop_task = None
         self.loop_lag.clear()
         return self.generation
 
@@ -440,9 +497,24 @@ class TunnelService:
         task.add_done_callback(self.tasks.discard)
         return task
 
+    def _active_source(self, bus, generation):
+        return not self.stopping and self.bus is bus and generation == self.generation
+
+    def _make_bus(self, code, peer_id, is_host, generation):
+        async def receive(message):
+            await self._signal(message, bus, generation)
+
+        def status(message):
+            if self._active_source(bus, generation):
+                self.signal_status(message)
+
+        bus = SignalBus(code, peer_id, is_host, receive, status, endpoint=self.endpoint)
+        return bus
+
     def signal_status(self, message):
         state = "hosting" if self.role == "host" else (
-            "connected" if any(p.ready.is_set() and not p.closed for p in self.peers.values()) else "connecting")
+            "connected" if any(p.ready.is_set() and not p.closed for p in self.peers.values()) else
+            "waiting_approval" if self.waiting_approval else "connecting")
         self.emit({"type": "status", "state": state,
                    "role": self.role, "message": message})
 
@@ -468,8 +540,7 @@ class TunnelService:
         self.sent = self.received = 0
         self.code = new_code()
         self.signal_status("Preparando o convite…")
-        bus = SignalBus(self.code, "host", True, self._signal,
-                        self.signal_status, endpoint=self.endpoint)
+        bus = self._make_bus(self.code, "host", True, generation)
         self.bus = bus
         try:
             await bus.start()
@@ -498,8 +569,7 @@ class TunnelService:
         self.stopping = False
         self.sent = self.received = 0
         self.signal_status("Encontrando o mundo…")
-        bus = SignalBus(self.code, uuid.uuid4().hex, False, self._signal,
-                        self.signal_status, endpoint=self.endpoint)
+        bus = self._make_bus(self.code, uuid.uuid4().hex, False, generation)
         self.bus = bus
         try:
             await bus.start()
@@ -509,8 +579,15 @@ class TunnelService:
             peer.notify("connecting")
             sdp = await peer.offer()
             self._check_start(generation)
-            await bus.send("host", {"type": "offer", "sdp": sdp, "name": safe_name(name)})
+            if self.identity is None:
+                self.identity = Identity.load_or_create()
+            guest_name = safe_name(name)
+            proof = self.identity.sign_offer(self.code, bus.peer_id, sdp, guest_name)
+            await bus.send("host", {"type": "offer", "sdp": sdp, "name": guest_name, "identity": proof})
             self._check_start(generation)
+            self.waiting_approval = not peer.answer_received.is_set()
+            if self.waiting_approval:
+                self.signal_status("Pedido enviado. Aguardando aprovação do anfitrião…")
             peer.connect_task = asyncio.create_task(peer.wait_connected())
             self.metrics_task = asyncio.create_task(self._metrics())
             self.loop_lag_task = asyncio.create_task(self._measure_loop())
@@ -522,38 +599,329 @@ class TunnelService:
                 await bus.close()
             raise
 
-    async def _signal(self, message):
+    async def _signal(self, message, bus=None, generation=None):
         # Never block the subscription reader on ICE gathering or TCP work.
-        if not self.stopping:
-            self.spawn(self._handle_signal(message))
+        bus = self.bus if bus is None else bus
+        generation = self.generation if generation is None else generation
+        if self._active_source(bus, generation):
+            self.spawn(self._handle_signal(message, bus, generation))
 
-    async def _handle_signal(self, message):
+    def _admission(self, peer_id, request, state):
+        self.emit({"type": "admission", "peer_id": peer_id,
+                   "name": request["name"], "state": state,
+                   "fingerprint": request.get("fingerprint", ""),
+                   "can_trust": bool(request.get("public_key")),
+                   "trusted": self._is_trusted(request.get("public_key"), request.get("fingerprint"))})
+
+    def _take_request(self, peer_id, state):
+        request = self.pending_requests.pop(peer_id)
+        expiry = request.get("expiry")
+        if expiry and expiry is not asyncio.current_task():
+            expiry.cancel()
+        self._admission(peer_id, request, state)
+        return request
+
+    def _require_host(self):
+        if self.role != "host" or self.stopping or not self.bus or self.starting:
+            raise ValueError("Abra uma sala antes de usar este controle.")
+
+    def _require_room(self, bus, generation):
+        self._require_host()
+        if not self._active_source(bus, generation):
+            raise ValueError("A sala ou o convite mudou. Use os controles da sala atual.")
+
+    async def _decline(self, bus, generation, peer_id, message):
+        if self._active_source(bus, generation):
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(bus.send(peer_id, {"type": "error", "message": message}), 2)
+
+    async def _expire_request(self, peer_id, request, bus, generation):
+        await asyncio.sleep(max(0, request["expires_at"] - time.monotonic()))
+        if not self._active_source(bus, generation) or self.pending_requests.get(peer_id) is not request:
+            return
+        self._take_request(peer_id, "expired")
+        await self._decline(bus, generation, peer_id, "O pedido de entrada expirou. Entre novamente.")
+
+    async def trusted_computers(self):
+        computers = self._trusted_list()
+        self.emit({"type": "trusted", "computers": computers})
+        return computers
+
+    def _is_trusted(self, public_key, fingerprint):
+        if not public_key or fingerprint in self.revoked_fingerprints:
+            return False
+        try:
+            trusted = self.trust_store.is_trusted(public_key)
+        except (OSError, ValueError):
+            self._trust_read_failure()
+            return False
+        self.trust_read_failed = False
+        return trusted
+
+    def _trust_read_failure(self):
+        if not self.trust_read_failed:
+            self.trust_read_failed = True
+            self.emit({"type": "error", "operation": "trust", "message":
+                       "Não foi possível ler os computadores confiáveis. Novas entradas vão aguardar aprovação."})
+
+    def _trusted_list(self):
+        return [item for item in self.trust_store.list()
+                if item["fingerprint"] not in self.revoked_fingerprints]
+
+    def _trust_changed(self, public_key=None):
+        for peer in list(self.peers.values()):
+            if peer.public_key and (public_key is None or peer.public_key == public_key):
+                peer.notify("connected" if peer.ready.is_set() else "connecting")
+        for peer_id, request in list(self.pending_requests.items()):
+            if request.get("public_key") and (public_key is None or request["public_key"] == public_key):
+                self._admission(peer_id, request, "pending")
+        try:
+            computers = self._trusted_list()
+        except (OSError, ValueError):
+            self._trust_read_failure()
+            computers = []
+        self.emit({"type": "trusted", "computers": computers})
+
+    async def set_trusted(self, peer_id, trusted):
+        if not isinstance(trusted, bool):
+            raise ValueError("Escolha se deseja confiar neste computador.")
+        bus, generation = self.bus, self.generation
+        async with self.room_lock:
+            self._require_room(bus, generation)
+            peer = self.peers.get(peer_id)
+            if not peer or peer.closed or not peer.ready.is_set():
+                raise ValueError("Este participante já saiu ou ainda está conectando.")
+            if not peer.public_key:
+                raise ValueError("Este computador precisa atualizar o Ponte para permitir confiança.")
+            if trusted:
+                self.trust_store.remember(peer.public_key, peer.name, timeout=0)
+                self.revoked_fingerprints.discard(peer.fingerprint)
+            else:
+                self.revoked_fingerprints.add(peer.fingerprint)
+                try:
+                    self.trust_store.forget(peer.fingerprint, timeout=0)
+                finally:
+                    self._trust_changed(peer.public_key)
+                return
+            self._trust_changed(peer.public_key)
+
+    async def forget_trusted(self, fingerprint):
+        if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise ValueError("Identificação do computador inválida.")
+        self.revoked_fingerprints.add(fingerprint)
+        try:
+            self.trust_store.forget(fingerprint, timeout=0)
+        finally:
+            self._trust_changed()
+
+    async def approve(self, peer_id, remember=False):
+        return await self._approve(peer_id, remember)
+
+    async def _approve(self, peer_id, remember=False, *, automatic=False):
+        bus, generation = self.bus, self.generation
+        async with self.room_lock:
+            self._require_room(bus, generation)
+            request = self.pending_requests.get(peer_id)
+            if request is None:
+                raise ValueError("Este pedido já foi encerrado. Aguarde um novo pedido de entrada.")
+            if automatic and not self._is_trusted(request.get("public_key"), request.get("fingerprint")):
+                return
+            if request["expires_at"] <= time.monotonic():
+                self._take_request(peer_id, "expired")
+                self.spawn(self._decline(bus, generation, peer_id, "O pedido de entrada expirou. Entre novamente."))
+                raise ValueError("Este pedido expirou. A pessoa precisa entrar novamente.")
+            if len(self.peers) >= MAX_PEERS:
+                raise ValueError("A sala já tem oito participantes. Remova alguém antes de aprovar.")
+            if remember:
+                if not request.get("public_key"):
+                    raise ValueError("Este computador precisa atualizar o Ponte para permitir confiança.")
+                self.trust_store.remember(request["public_key"], request["name"], timeout=0)
+                self.revoked_fingerprints.discard(request["fingerprint"])
+            self._take_request(peer_id, "approved")
+            peer = TunnelPeer(self, peer_id, request["name"])
+            peer.public_key = request.get("public_key")
+            peer.fingerprint = request.get("fingerprint", "")
+            self.peers[peer_id] = peer
+            peer.notify("connecting")
+            if remember:
+                self._trust_changed(peer.public_key)
+            peer.negotiation_task = asyncio.current_task()
+        try:
+            sdp = await peer.answer(request["sdp"])
+            if not self._active_source(bus, generation) or self.peers.get(peer_id) is not peer:
+                await peer.close()
+                return
+            await bus.send(peer_id, {"type": "answer", "sdp": sdp, "name": self.name})
+            if not self._active_source(bus, generation) or peer.closed:
+                await peer.close()
+                return
+            peer.connect_task = asyncio.create_task(peer.wait_connected())
+        except BaseException:
+            await peer.close()
+            raise
+        finally:
+            peer.negotiation_task = None
+
+    async def _approve_trusted(self, peer_id, request, bus, generation):
+        if not self._active_source(bus, generation) or self.pending_requests.get(peer_id) is not request:
+            return
+        try:
+            await self._approve(peer_id, automatic=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if self._active_source(bus, generation):
+                self.emit({"type": "error", "operation": "peer", "peer_id": peer_id,
+                           "message": "Não foi possível concluir a entrada do computador confiável. Tente novamente."})
+
+    async def reject(self, peer_id):
+        bus, generation = self.bus, self.generation
+        async with self.room_lock:
+            self._require_room(bus, generation)
+            if peer_id not in self.pending_requests:
+                raise ValueError("Este pedido já foi encerrado. Aguarde um novo pedido de entrada.")
+            self._take_request(peer_id, "rejected")
+        await self._decline(bus, generation, peer_id, "O anfitrião recusou o pedido de entrada.")
+
+    async def remove_peer(self, peer_id):
+        bus, generation = self.bus, self.generation
+        trust_error = None
+        async with self.room_lock:
+            self._require_room(bus, generation)
+            peer = self.peers.get(peer_id)
+            if peer is None or peer.closed:
+                raise ValueError("Este participante já saiu da sala.")
+            if peer.public_key:
+                self.revoked_fingerprints.add(peer.fingerprint)
+                try:
+                    self.trust_store.forget(peer.fingerprint, timeout=0)
+                except (OSError, ValueError) as exc:
+                    trust_error = exc
+            self.peers.pop(peer_id)
+        await peer.close()
+        if peer.public_key:
+            self._trust_changed(peer.public_key)
+        if trust_error:
+            self.emit({"type": "error", "operation": "trust", "peer_id": peer_id,
+                       "fingerprint": peer.fingerprint, "message":
+                       "Participante removido e confiança revogada nesta execução. Não foi possível salvar a revogação no disco."})
+        # RTC closure revokes the direct path immediately, even after renewal
+        # has retired the rendezvous used by this participant.
+        if self._active_source(bus, generation):
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(bus.send(peer_id, {"type": "bye", "message":
+                    "O anfitrião removeu você da sala."}), 1)
+
+    async def renew_invite(self):
+        old_bus, generation = self.bus, self.generation
+        async with self.room_lock:
+            self._require_room(old_bus, generation)
+            if self.renew_task:
+                raise ValueError("O convite já está sendo renovado.")
+            self.renew_task = asyncio.current_task()
+            self.emit({"type": "room_action", "state": "renewing", "message": "Renovando convite…"})
+        candidate = None
+        try:
+            candidate = self._make_bus(new_code(), "host", True, generation + 1)
+            self.replacement_bus = candidate
+            await candidate.start()
+            async with self.room_lock:
+                if not self._active_source(old_bus, generation):
+                    raise asyncio.CancelledError()
+                self.generation += 1
+                self.retired_buses.add(old_bus)
+                self.bus, self.code = candidate, candidate.code
+                self.replacement_bus = None
+                cancelled = list(self.pending_requests)
+                for peer_id in list(self.pending_requests):
+                    self._take_request(peer_id, "cancelled")
+                self.request_ids.clear()
+                unfinished = []
+                for peer in list(self.peers.values()):
+                    if not peer.ready.is_set():
+                        cancelled.append(peer.peer_id)
+                        self.peers.pop(peer.peer_id)
+                        unfinished.append(peer)
+            await asyncio.gather(*(peer.close() for peer in unfinished))
+            await asyncio.gather(*(asyncio.wait_for(old_bus.send(peer_id, {"type": "error", "message":
+                "O convite foi renovado. Peça o novo convite ao anfitrião."}), .5)
+                for peer_id in cancelled), return_exceptions=True)
+            await old_bus.close()
+            self.retired_buses.discard(old_bus)
+            self._check_start(generation + 1)
+            self.emit({"type": "room", "code": self.code, "name": self.name,
+                       "port": self.host_port, "renewed": True})
+            return self.code
+        except BaseException:
+            if candidate and self.bus is not candidate:
+                await candidate.close()
+            raise
+        finally:
+            if self.replacement_bus is candidate:
+                self.replacement_bus = None
+            if self.renew_task is asyncio.current_task():
+                self.renew_task = None
+                self.emit({"type": "room_action", "state": "ready", "message": ""})
+
+    async def _handle_signal(self, message, bus=None, generation=None):
+        bus = self.bus if bus is None else bus
+        generation = self.generation if generation is None else generation
+        if not self._active_source(bus, generation):
+            return
         sender, kind = message.get("_sender"), message.get("type")
+        peer = None
         try:
             if self.role == "host" and kind == "offer" and sender != "host":
-                if sender in self.peers:
-                    return
-                if len(self.peers) >= MAX_PEERS:
-                    await self.bus.send(sender, {"type": "error", "message": "A sala já tem oito amigos conectados."})
-                    return
-                peer = TunnelPeer(self, sender, message.get("name", "Amigo"))
-                self.peers[sender] = peer
-                peer.notify("connecting")
-                sdp = await peer.answer(message.get("sdp"))
-                if self.stopping or not self.bus:
-                    await peer.close()
-                    return
-                await self.bus.send(sender, {"type": "answer", "sdp": sdp, "name": self.name})
-                peer.connect_task = asyncio.create_task(peer.wait_connected())
+                async with self.room_lock:
+                    if not self._active_source(bus, generation) or sender in self.peers or sender in self.request_ids:
+                        return
+                    if not isinstance(sender, str) or not re.fullmatch(r"[0-9a-f]{32}", sender):
+                        return
+                    if len(self.request_ids) >= MAX_REQUEST_IDS:
+                        self.spawn(self._decline(bus, generation, sender, "Renove o convite para receber novos pedidos."))
+                        return
+                    # Keep bounded tombstones for the invitation lifetime: a
+                    # duplicate or rejected sender must explicitly join anew.
+                    self.request_ids.add(sender)
+                    if len(self.pending_requests) >= MAX_PENDING or len(self.peers) >= MAX_PEERS:
+                        self.spawn(self._decline(bus, generation, sender, "A sala está sem vagas para novos pedidos. Tente novamente depois."))
+                        return
+                    sdp = admission_description(message.get("sdp"))
+                    identity = (verify_offer(self.code, sender, sdp, message.get("name", "Amigo"),
+                                             message["identity"]) if "identity" in message else {})
+                    request = {"name": safe_name(message.get("name", "Amigo")), "sdp": sdp,
+                               **identity,
+                               "expires_at": time.monotonic() + APPROVAL_TIMEOUT}
+                    self.pending_requests[sender] = request
+                    request["expiry"] = self.spawn(self._expire_request(sender, request, bus, generation))
+                    self._admission(sender, request, "pending")
+                await bus.send(sender, {"type": "hello", "state": "pending"})
+                if (self._active_source(bus, generation) and request.get("public_key")
+                        and self._is_trusted(request["public_key"], request.get("fingerprint"))):
+                    self.spawn(self._approve_trusted(sender, request, bus, generation))
             elif self.role == "guest" and sender == "host" and kind == "answer":
                 peer = self.peers.get("host")
                 if peer and peer.pc.signalingState == "have-local-offer":
                     peer.name = safe_name(message.get("name", "Anfitrião"))
                     await peer.accept_answer(message.get("sdp"))
+                    if self._active_source(bus, generation) and not peer.closed:
+                        peer.answer_received.set()
+                        self.waiting_approval = False
+                        self.signal_status("Entrada aprovada. Criando conexão direta…")
+            elif self.role == "guest" and sender == "host" and kind == "hello" and message.get("state") == "pending":
+                peer = self.peers.get("host")
+                if peer and not peer.answer_received.is_set():
+                    self.waiting_approval = True
+                    self.signal_status("Aguardando aprovação do anfitrião…")
+            elif self.role == "host" and kind == "bye" and sender in self.pending_requests:
+                async with self.room_lock:
+                    if self._active_source(bus, generation) and sender in self.pending_requests:
+                        self._take_request(sender, "cancelled")
             elif kind == "bye" and sender in self.peers:
-                await self.peers[sender].close()
+                peer = self.peers[sender]
+                await peer.close()
                 if self.role == "guest":
-                    self.emit({"type": "error", "message": "O anfitrião encerrou a sala."})
+                    self.emit({"type": "error", "message": safe_name(message.get("message", "O anfitrião encerrou a sala."))})
                     asyncio.create_task(self.stop())
             elif self.role == "guest" and sender == "host" and kind == "error":
                 self.emit({"type": "error", "message": safe_name(message.get("message", "Não foi possível entrar na sala."))})
@@ -562,8 +930,10 @@ class TunnelService:
             raise
         except Exception as exc:
             LOG.warning("Negociação interrompida: %s", type(exc).__name__)
-            if sender in self.peers:
-                await self.peers[sender].close()
+            if not self._active_source(bus, generation):
+                return
+            if peer and self.peers.get(sender) is peer:
+                await peer.close()
             self.emit({"type": "error", "message": "Não foi possível negociar a conexão direta. Tente entrar novamente.",
                        "operation": "peer" if self.role == "host" else "connection"})
             if self.role == "guest":
@@ -610,11 +980,29 @@ class TunnelService:
             pass
 
     async def stop(self):
+        if self.stop_task is None:
+            self.stop_task = asyncio.create_task(self._stop())
+        await asyncio.shield(self.stop_task)
+
+    async def _stop(self):
         if self.stopping:
             return
         self.generation += 1
         self.starting = False
         self.stopping = True
+        renewing = self.renew_task
+        if renewing and renewing is not asyncio.current_task():
+            # Once committed, let the short RTC/retired-bus cleanup finish;
+            # cancelling it midway could interrupt RTCPeerConnection.close().
+            if self.replacement_bus is not None:
+                renewing.cancel()
+            await asyncio.gather(renewing, return_exceptions=True)
+        replacement, self.replacement_bus = self.replacement_bus, None
+        if replacement:
+            await replacement.close()
+        for retired in list(self.retired_buses):
+            await retired.close()
+            self.retired_buses.discard(retired)
         server, self.server = self.server, None
         if server:
             server.close()
@@ -622,6 +1010,9 @@ class TunnelService:
             if task is not asyncio.current_task():
                 task.cancel()
         await asyncio.gather(*(t for t in list(self.tasks) if t is not asyncio.current_task()), return_exceptions=True)
+        for peer_id in list(self.pending_requests):
+            self._take_request(peer_id, "cancelled")
+        self.request_ids.clear()
         # Data-channel closure is immediate. A bye publish is best-effort only.
         for peer in list(self.peers.values()):
             await peer.close()
@@ -640,8 +1031,12 @@ class TunnelService:
             self.loop_lag_task = None
         if self.bus:
             bus, self.bus = self.bus, None
+            if self.role == "guest" and self.waiting_approval:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(bus.send("host", {"type": "bye"}), .3)
             await bus.close()
         self.code = ""
+        self.waiting_approval = False
         self.emit({"type": "status", "state": "stopped", "message": "Conexão encerrada.", "role": self.role})
 
     def diagnostics(self):

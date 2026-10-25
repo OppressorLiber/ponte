@@ -230,7 +230,7 @@ class SendBufferTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(channel.sent, [b"data"])
 
     def peer(self):
-        peer = SimpleNamespace(streams=set(), control=None, owner=SimpleNamespace(sent=0),
+        peer = SimpleNamespace(streams=set(), control=None, closed=False, owner=SimpleNamespace(sent=0),
                                _control_message=lambda raw: None, _opened=lambda: None)
         peer.send_buffer = SendBuffer(lambda: core.outgoing_buffered(peer), limit=16)
         self.buffers.append(peer.send_buffer)

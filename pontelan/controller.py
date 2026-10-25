@@ -94,7 +94,7 @@ class Controller(QObject):
     def install_update(self):
         self.loop.call_soon_threadsafe(lambda: self._schedule_update(self.updater.install()))
 
-    def _submit(self, coroutine, operation="connection"):
+    def _submit(self, coroutine, operation="connection", **context):
         future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
         def finished(result):
             try:
@@ -103,9 +103,12 @@ class Controller(QObject):
                 return
             except Exception as exc:
                 logging.getLogger(__name__).warning("Operação falhou: %s", type(exc).__name__)
-                message = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else (
-                    "Não consegui concluir a conexão. Confira a internet e tente novamente.")
-                self.event.emit({"type": "error", "message": message, "operation": operation})
+                fallback = {
+                    "trust": "Não consegui atualizar a lista de confiança. Tente novamente.",
+                    "room": "Não consegui concluir esta ação na sala. Tente novamente.",
+                }.get(operation, "Não consegui concluir a conexão. Confira a internet e tente novamente.")
+                message = str(exc) if isinstance(exc, (ValueError, RuntimeError, TimeoutError)) else fallback
+                self.event.emit({"type": "error", "message": message, "operation": operation, **context})
         future.add_done_callback(finished)
         return future
 
@@ -116,12 +119,40 @@ class Controller(QObject):
         self.event.emit({"type": "status", "state": "connecting", "role": "host", "message": "Abrindo sua sala…"})
         self._submit(self.service.host(port, name))
 
-    @Slot(str, int)
-    def join(self, code, port=0):
+    @Slot(str, int, str)
+    def join(self, code, port=0, name="Amigo"):
         if self.updater.installing:
             return
         self.event.emit({"type": "status", "state": "connecting", "role": "guest", "message": "Encontrando o mundo…"})
-        self._submit(self.service.join(code, port))
+        self._submit(self.service.join(code, port, name))
+
+    @Slot(str, bool)
+    def approve(self, peer_id, remember=False):
+        self._submit(self.service.approve(peer_id, remember), "room", peer_id=peer_id)
+
+    @Slot(str)
+    def reject(self, peer_id):
+        self._submit(self.service.reject(peer_id), "room", peer_id=peer_id)
+
+    @Slot(str)
+    def remove_peer(self, peer_id):
+        self._submit(self.service.remove_peer(peer_id), "room", peer_id=peer_id)
+
+    @Slot(str, bool)
+    def set_trusted(self, peer_id, trusted):
+        self._submit(self.service.set_trusted(peer_id, trusted), "trust", peer_id=peer_id)
+
+    @Slot(str)
+    def forget_trusted(self, fingerprint):
+        self._submit(self.service.forget_trusted(fingerprint), "trust", fingerprint=fingerprint)
+
+    @Slot()
+    def trusted_computers(self):
+        self._submit(self.service.trusted_computers(), "trust")
+
+    @Slot()
+    def renew_invite(self):
+        self._submit(self.service.renew_invite(), "room")
 
     @Slot()
     def stop(self):

@@ -12,8 +12,9 @@ import unittest
 from unittest.mock import patch
 
 from pontelan import core
+from pontelan.identity import Identity, TrustStore
 from pontelan.event_loop import NetworkEventLoop
-from qa_transport import MemorySignalBus, original_read, wait_for_listener
+from qa_transport import MemorySignalBus, original_read, wait_for_listener, approve_fixture_request
 
 
 class TransportConditionsTests(unittest.IsolatedAsyncioTestCase):
@@ -126,12 +127,13 @@ class TransportConditionsTests(unittest.IsolatedAsyncioTestCase):
 
     async def connect(self):
         self.server = await asyncio.start_server(self.fixture, '127.0.0.1', 0)
-        self.host = core.TunnelService(lambda event: None, stun=False)
+        self.host = core.TunnelService(lambda event: None, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
         events = []
-        self.guest = core.TunnelService(events.append, stun=False)
+        self.guest = core.TunnelService(events.append, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
         self.services.extend((self.host, self.guest))
         await self.host.host(self.server.sockets[0].getsockname()[1], 'Isolated transport conditions')
         await self.guest.join(self.host.code)
+        await approve_fixture_request(self.host)
         await wait_for_listener(self.guest, events)
         peer = self.guest.peers['host']
         self.assertEqual(peer.pc.sctp.transport.state, 'connected')

@@ -16,7 +16,7 @@ from pathlib import Path
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSettings, Qt, QTimer, QUrl, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QFrame,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QPlainTextEdit, QPushButton, QScrollArea,
     QSizePolicy, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
@@ -152,9 +152,90 @@ class BridgeIllustration(QWidget):
         painter.drawRoundedRect(int(right - 4), 42, 8, 8, 2, 2)
 
 
-class PeerRow(QFrame):
-    def __init__(self, peer: dict, parent=None):
+class _NameLabel(QLabel):
+    """Keep arbitrary user names from displacing the row's action buttons."""
+
+    def __init__(self):
+        super().__init__()
+        self._full_text = ""
+        self.setProperty("role", "label")
+        self.setFont(_font(10, QFont.Weight.DemiBold))
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+
+    def setText(self, text: str):
+        self._full_text = text
+        self.setAccessibleName(text)
+        self._elide()
+
+    def _elide(self):
+        super().setText(self.fontMetrics().elidedText(self._full_text, Qt.TextElideMode.ElideRight, self.width()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+
+class AdmissionRow(QFrame):
+    """One entry request; actions always retain the request's stable ID."""
+
+    def __init__(self, admission: dict, on_action, parent=None):
         super().__init__(parent)
+        self.peer_id = str(admission["peer_id"])
+        self.setObjectName(f"admission_{self.peer_id}")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 8, 0, 8)
+        layout.setSpacing(8)
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        self.name_label = _NameLabel()
+        self.detail_label = _label(f"Pedido · {self.peer_id[:6]}", role="caption")
+        self.name_label.setToolTip("Nome informado pela pessoa; não é uma identidade verificada do Minecraft.")
+        text.addWidget(self.name_label)
+        text.addWidget(self.detail_label)
+        self.trust_checkbox = QCheckBox("Confiar neste computador")
+        self.trust_checkbox.setObjectName("rememberComputerCheckbox")
+        self.trust_checkbox.setFont(_font(9))
+        self.trust_checkbox.setToolTip("Nas próximas salas, este computador entra com um convite válido sem nova aprovação. Você pode desfazer depois.")
+        text.addWidget(self.trust_checkbox)
+        layout.addLayout(text, 1)
+        self.approve_button = _button("Aprovar", "approveEntryButton", "approval")
+        self.reject_button = _button("Recusar", "rejectEntryButton")
+        self.approve_button.clicked.connect(lambda: on_action(self.peer_id, "approve", self.trust_checkbox.isChecked()))
+        self.reject_button.clicked.connect(lambda: on_action(self.peer_id, "reject"))
+        layout.addWidget(self.approve_button)
+        layout.addWidget(self.reject_button)
+        self.update_admission(admission)
+
+    def update_admission(self, admission: dict):
+        name = str(admission.get("name") or "Amigo")
+        self.name_label.setText(name)
+        self.name_label.setToolTip(f"{name}\nNome informado pela pessoa; não é uma identidade verificada do Minecraft.")
+        self._can_trust = bool(admission.get("can_trust") and admission.get("fingerprint"))
+        fingerprint = str(admission.get("fingerprint") or "")
+        self.detail_label.setText(f"Chave · {fingerprint[:12]}" if self._can_trust else f"Pedido · {self.peer_id[:6]}")
+        self.detail_label.setToolTip("Identifica a chave local deste computador." if self._can_trust else "")
+        self.trust_checkbox.setVisible(self._can_trust)
+        if not self._can_trust:
+            self.trust_checkbox.setChecked(False)
+        self.approve_button.setAccessibleName(f"Aprovar {name}, pedido {self.peer_id[:6]}")
+        self.reject_button.setAccessibleName(f"Recusar {name}, pedido {self.peer_id[:6]}")
+
+    def set_action_state(self, enabled: bool, action: str = ""):
+        self.approve_button.setEnabled(enabled)
+        self.reject_button.setEnabled(enabled)
+        self.trust_checkbox.setEnabled(enabled)
+        self.approve_button.setText("Aprovando…" if action == "approve" else "Aprovar")
+        self.reject_button.setText("Recusando…" if action == "reject" else "Recusar")
+
+
+class PeerRow(QFrame):
+    def __init__(self, peer: dict, parent=None, *, on_remove=None, on_trust=None):
+        super().__init__(parent)
+        self.peer_id = str(peer.get("peer_id") or "unknown")
+        self._on_remove = on_remove
+        self._on_trust = on_trust
         self.setObjectName("peerRow")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 9, 0, 9)
@@ -166,20 +247,43 @@ class PeerRow(QFrame):
         layout.addWidget(self.avatar)
         text = QVBoxLayout()
         text.setSpacing(1)
-        self.name_label = _label("", role="label", wrap=True)
+        self.name_label = _NameLabel()
         self.detail_label = _label("", role="caption", wrap=True)
+        self.detail_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         text.addWidget(self.name_label)
         text.addWidget(self.detail_label)
+        text.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(text, 1)
         self.state_label = _label("", role="caption")
         layout.addWidget(self.state_label)
+        self.remove_button = _button("Remover", "removePeerButton", "quiet")
+        self.remove_button.setMinimumHeight(38)
+        self.remove_button.setToolTip("Para voltar, precisa de nova aprovação.")
+        self.remove_button.clicked.connect(lambda: self._on_remove(self.peer_id) if self._on_remove else None)
+        actions = QVBoxLayout()
+        actions.setSpacing(0)
+        self.trust_button = _button("Confiar", "trustPeerButton", "quiet")
+        self.trust_button.setFont(_font(9.5, QFont.Weight.DemiBold))
+        self.trust_button.clicked.connect(lambda: self._on_trust(self.peer_id, not self._trusted) if self._on_trust else None)
+        actions.addWidget(self.trust_button)
+        actions.addWidget(self.remove_button)
+        layout.addLayout(actions)
         self.update_peer(peer)
 
     def update_peer(self, peer: dict):
         name = str(peer.get("name") or "Outro jogador")
         self.name_label.setText(name)
+        self.name_label.setToolTip(name)
         self.avatar.setText(name[:1].upper())
         state = str(peer.get("state", "connecting"))
+        self._peer_state = state
+        self._can_trust = bool(peer.get("can_trust") and peer.get("fingerprint"))
+        self._trusted = bool(peer.get("trusted"))
+        self.trust_button.setAccessibleName(f"{'Deixar de confiar no' if self._trusted else 'Confiar no'} computador de {name}")
+        self.trust_button.setToolTip("Deixar de confiar: a próxima entrada precisará de aprovação. A partida continua."
+                                     if self._trusted else "Entrar automaticamente nas próximas salas com um convite válido.")
+        self.remove_button.setAccessibleName(f"Remover {name} da sessão")
+        self.set_manageable(False)
         states = {
             "connecting": "Conectando", "connected": "Conectado",
             "disconnected": "Desconectado", "failed": "Falha na conexão",
@@ -206,6 +310,42 @@ class PeerRow(QFrame):
                 f"Mediana {format_rtt(peer.get('rtt_p50_ms'))} · p95 {format_rtt(peer.get('rtt_p95_ms'))}\n"
                 f"Rota ICE: {route}")
 
+    def set_manageable(self, allowed: bool, busy: bool = False, action: str = ""):
+        self.remove_button.setVisible(allowed and self._peer_state in ("connecting", "connected"))
+        self.remove_button.setEnabled(not busy)
+        self.remove_button.setText("Removendo…" if action == "remove" else "Remover")
+        self.trust_button.setVisible(allowed and self._can_trust and self._peer_state == "connected")
+        self.trust_button.setEnabled(not busy)
+        self.trust_button.setText("Salvando…" if action in ("trust", "untrust") else "Confiável" if self._trusted else "Confiar")
+
+
+class TrustedComputerRow(QFrame):
+    def __init__(self, computer: dict, on_forget, parent=None):
+        super().__init__(parent)
+        self.fingerprint = str(computer["fingerprint"])
+        self.setObjectName("trustedComputerRow")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 8, 0, 8)
+        layout.setSpacing(12)
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        self.name_label = _NameLabel()
+        name = str(computer.get("name") or "Amigo")
+        self.name_label.setText(name)
+        self.name_label.setToolTip(name)
+        text.addWidget(self.name_label)
+        text.addWidget(_label(f"Chave · {self.fingerprint[:12]}", role="caption"))
+        layout.addLayout(text, 1)
+        self.forget_button = _button("Esquecer", "forgetTrustedButton")
+        self.forget_button.setAccessibleName(f"Esquecer computador de {name}, chave {self.fingerprint[:12]}")
+        self.forget_button.setToolTip("A próxima entrada precisa de aprovação. A partida atual continua.")
+        self.forget_button.clicked.connect(lambda: on_forget(self.fingerprint))
+        layout.addWidget(self.forget_button)
+
+    def set_pending(self, pending: bool):
+        self.forget_button.setEnabled(not pending)
+        self.forget_button.setText("Esquecendo…" if pending else "Esquecer")
+
 
 class MainWindow(QMainWindow):
     """UI contract: controller.event is a Qt Signal(dict); actions are methods."""
@@ -222,6 +362,14 @@ class MainWindow(QMainWindow):
         self._address = ""
         self._peers: dict[str, dict] = {}
         self._peer_rows: dict[str, PeerRow] = {}
+        self._admissions: dict[str, dict] = {}
+        self._admission_rows: dict[str, AdmissionRow] = {}
+        self._peer_actions: dict[str, str] = {}
+        self._renewing_invite = False
+        self._trusted_computers: dict[str, dict] = {}
+        self._trusted_rows: dict[str, TrustedComputerRow] = {}
+        self._forgetting: set[str] = set()
+        self._trusted_dialog: QDialog | None = None
         self._animation = None
         self._update_state = ""
         self._update_version = ""
@@ -245,6 +393,8 @@ class MainWindow(QMainWindow):
         self._apply_styles()
         self.controller.event.connect(self.handle_event)
         self._set_tab("host", animate=False)
+        if callable(getattr(self.controller, "trusted_computers", None)):
+            QTimer.singleShot(0, self._load_trusted_computers)
         QTimer.singleShot(350, self._scan_worlds)
 
     def _build_ui(self):
@@ -403,6 +553,9 @@ class MainWindow(QMainWindow):
         QWidget.setTabOrder(self.port_input, self.world_combo)
         QWidget.setTabOrder(self.world_combo, self.scan_button)
         QWidget.setTabOrder(self.scan_button, self.host_button)
+        QWidget.setTabOrder(self.guest_name, self.invite_input)
+        QWidget.setTabOrder(self.invite_input, self.join_button)
+        QWidget.setTabOrder(self.copy_button, self.renew_invite_button)
 
     def _build_host_page(self) -> QWidget:
         page = QWidget()
@@ -465,6 +618,10 @@ class MainWindow(QMainWindow):
         self.scan_hint = _label("Ou digite a porta que aparece no chat do jogo.", role="caption", wrap=True, name="scanHint")
         layout.addSpacing(7)
         layout.addWidget(self.scan_hint)
+        layout.addSpacing(8)
+        self.trusted_button = _button("Computadores de confiança (0)", "trustedComputersButton", "quiet")
+        self.trusted_button.clicked.connect(self._open_trusted_computers)
+        layout.addWidget(self.trusted_button, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addStretch(1)
         layout.addSpacing(20)
         self.host_button = _button("Criar convite", "createInviteButton", "primary")
@@ -484,6 +641,18 @@ class MainWindow(QMainWindow):
         layout.addSpacing(5)
         layout.addWidget(_label("Peça o convite a quem abriu o mundo.", role="caption", wrap=True))
         layout.addSpacing(20)
+        name_label = _label("Seu nome", role="label")
+        self.guest_name = QLineEdit()
+        self.guest_name.setObjectName("guestNameInput")
+        self.guest_name.setMaxLength(60)
+        self.guest_name.setText(self.settings.value("guest_name", "Amigo", type=str))
+        self.guest_name.setAccessibleName("Seu nome no pedido de entrada")
+        self.guest_name.setToolTip("O anfitrião verá este nome ao aprovar sua entrada. Não verifica sua identidade no Minecraft.")
+        name_label.setBuddy(self.guest_name)
+        layout.addWidget(name_label)
+        layout.addSpacing(6)
+        layout.addWidget(self.guest_name)
+        layout.addSpacing(15)
         label = _label("Convite do anfitrião", role="label")
         layout.addWidget(label)
         layout.addSpacing(7)
@@ -502,6 +671,7 @@ class MainWindow(QMainWindow):
         self.join_button = _button("Entrar no mundo", "joinButton", "primary")
         self.join_button.setMinimumHeight(42)
         self.join_button.clicked.connect(self._join)
+        self.guest_name.returnPressed.connect(self._join)
         layout.addWidget(self.join_button)
         return _scroll_page(page, "guestScroll", self.join_button)
 
@@ -546,17 +716,50 @@ class MainWindow(QMainWindow):
         self.copy_button = _button("Copiar convite", "copyConnectionButton", "primary")
         self.copy_button.setMinimumHeight(40)
         self.copy_button.clicked.connect(self._copy_connection)
-        layout.addWidget(self.copy_button)
+        connection_actions = QHBoxLayout()
+        connection_actions.setSpacing(8)
+        connection_actions.addWidget(self.copy_button, 1)
+        self.renew_invite_button = _button("Renovar convite", "renewInviteButton")
+        self.renew_invite_button.setMinimumHeight(40)
+        self.renew_invite_button.clicked.connect(self._renew_invite)
+        self.renew_invite_button.setToolTip("O convite antigo deixa de valer. Quem já entrou continua na sessão.")
+        connection_actions.addWidget(self.renew_invite_button)
+        layout.addLayout(connection_actions)
         layout.addSpacing(8)
         self.connection_hint = _label("Envie este convite para quem vai jogar com você.", role="caption", wrap=True, name="connectionHint")
         layout.addWidget(self.connection_hint)
+        self.renew_hint = _label("Ao renovar, o convite antigo deixa de valer. Quem já entrou continua.",
+                                role="caption", wrap=True, name="renewInviteHint")
+        layout.addSpacing(4)
+        layout.addWidget(self.renew_hint)
         layout.addSpacing(17)
+
+        # Requests use the page's scrolling flow, so each row keeps its natural
+        # height even in a compact window. Blue stays reserved for approval.
+        self.admissions_section = QWidget()
+        self.admissions_section.setObjectName("admissionsSection")
+        admissions_layout = QVBoxLayout(self.admissions_section)
+        admissions_layout.setContentsMargins(0, 0, 0, 12)
+        admissions_layout.setSpacing(0)
+        self.admissions_heading = _label("Pedidos de entrada", role="label", name="admissionsHeading")
+        admissions_layout.addWidget(self.admissions_heading)
+        self.admissions_layout = QVBoxLayout()
+        self.admissions_layout.setContentsMargins(0, 0, 0, 0)
+        self.admissions_layout.setSpacing(0)
+        admissions_layout.addLayout(self.admissions_layout)
+        layout.addWidget(self.admissions_section)
+        self.admissions_section.hide()
         peers_header = QHBoxLayout()
         self.peers_heading = _label("Na sessão", role="label")
         peers_header.addWidget(self.peers_heading)
         peers_header.addStretch()
         self.latency_label = _label("", role="caption", name="latencyLabel")
         peers_header.addWidget(self.latency_label)
+        self.trusted_session_button = _button("Confiança · 0", "sessionTrustedComputersButton", "quiet")
+        self.trusted_session_button.setFont(_font(9.5))
+        self.trusted_session_button.setToolTip("Gerenciar computadores de confiança, inclusive os que estão fora da sessão")
+        self.trusted_session_button.clicked.connect(self._open_trusted_computers)
+        peers_header.addWidget(self.trusted_session_button)
         layout.addLayout(peers_header)
 
         self.peers_scroll = QScrollArea()
@@ -564,7 +767,7 @@ class MainWindow(QMainWindow):
         self.peers_scroll.setWidgetResizable(True)
         self.peers_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.peers_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.peers_scroll.setMinimumHeight(45)
+        self.peers_scroll.setMinimumHeight(116)
         self.peers_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.peers_container = QWidget()
         self.peers_container.setObjectName("peersContainer")
@@ -576,6 +779,10 @@ class MainWindow(QMainWindow):
         self.peers_layout.addStretch(1)
         self.peers_scroll.setWidget(self.peers_container)
         layout.addWidget(self.peers_scroll, 1)
+        self.removal_hint = _label("Para voltar, precisa de nova aprovação.", role="caption", wrap=True,
+                                   name="removePeerHint")
+        layout.addSpacing(4)
+        layout.addWidget(self.removal_hint)
         return _scroll_page(page, "sessionScroll")
 
     def _build_guide(self) -> QWidget:
@@ -633,9 +840,11 @@ class MainWindow(QMainWindow):
         c = COLORS
         self.setStyleSheet(f"""
             QMainWindow, QWidget#appRoot {{ background: {c['porcelain']}; color: {c['ink']}; }}
+            QDialog#trustedComputersDialog {{ background: {c['porcelain']}; color: {c['ink']}; }}
             QLabel {{ color: {c['ink']}; background: transparent; border: none; }}
             QLabel[role="caption"], QLabel[role="meta"] {{ color: {c['muted']}; }}
             QLabel#pageSubtitle {{ color: {c['secondary']}; }}
+            QLabel#trustNotice {{ color: {c['error']}; }}
             QFrame#workspace {{ background: {c['paper']}; border: 1px solid #EBEDF2; border-radius: 16px; }}
             QFrame#segmentedControl {{ background: #F0F2F6; border-radius: 9px; }}
             QPushButton {{ background: {c['paper']}; border: 1px solid {c['edge']};
@@ -663,6 +872,10 @@ class MainWindow(QMainWindow):
             QPushButton[kind="update"]:hover {{ background: {c['river_hover']}; border-color: {c['river_hover']}; }}
             QPushButton[kind="update"]:focus {{ border-color: #98BAF1; }}
             QPushButton[kind="update"]:disabled {{ background: #A8BFE3; border-color: #A8BFE3; color: white; }}
+            QPushButton[kind="approval"] {{ background: {c['river_wash']}; border-color: #D6E5FC; color: {c['river']}; padding: 0 10px; }}
+            QPushButton[kind="approval"]:hover {{ background: #DCEAFE; border-color: #AFCBF3; }}
+            QPushButton[kind="approval"]:focus {{ border-color: #80A9EB; }}
+            QPushButton[kind="approval"]:disabled {{ background: #EFF3F8; color: #8997AA; border-color: #E8EBF0; }}
             QPushButton#stopSessionButton {{ color: {c['error']}; }}
             QLineEdit, QSpinBox, QComboBox, QPlainTextEdit {{ background: {c['inset']};
                 color: {c['ink']}; border: 1px solid {c['edge']}; border-radius: 7px;
@@ -675,7 +888,8 @@ class MainWindow(QMainWindow):
             QComboBox QAbstractItemView {{ background: white; selection-background-color: {c['river_wash']};
                 selection-color: {c['ink']}; border: 1px solid {c['edge']}; padding: 4px; outline: none; }}
             QWidget#hostPage, QWidget#guestPage, QWidget#sessionPage, QStackedWidget,
-            QScrollArea, QWidget#peersContainer, QWidget[role="page"] {{ background: transparent; border: none; }}
+            QScrollArea, QWidget#peersContainer, QWidget#admissionsSection,
+            QWidget#trustedComputersContainer, QWidget[role="page"] {{ background: transparent; border: none; }}
             QLabel#statusBadge {{ padding: 6px 11px; background: #E9EDF3; border-radius: 12px; color: {c['secondary']}; }}
             QLabel#statusBadge[state="active"] {{ background: {c['green_wash']}; color: {c['green']}; }}
             QLabel#statusBadge[state="busy"] {{ background: {c['river_wash']}; color: {c['river']}; }}
@@ -711,6 +925,7 @@ class MainWindow(QMainWindow):
         self.guest_tab.setChecked(role == "guest")
         self._switch_page(self.host_page if role == "host" else self.guest_page, animate)
         self._update_guide()
+        self._render_trusted_controls()
 
     def _switch_page(self, page: QWidget, animate: bool = True):
         if self.pages.currentWidget() is page:
@@ -755,7 +970,7 @@ class MainWindow(QMainWindow):
         self.host_tab.setEnabled(not busy and not self._session)
         self.guest_tab.setEnabled(not busy and not self._session)
         for control in (self.world_name, self.port_input, self.world_combo, self.host_button,
-                        self.invite_input, self.join_button):
+                        self.guest_name, self.invite_input, self.join_button):
             control.setEnabled(not busy)
         self.scan_button.setEnabled(not busy)
         self.host_button.setText("Criando convite…" if busy and self._role == "host" else "Criar convite")
@@ -776,13 +991,18 @@ class MainWindow(QMainWindow):
         host = self._role == "host"
         self.code_display.setVisible(host)
         self.address_display.setVisible(not host)
+        self.connection_label.setVisible(True)
+        self.copy_button.setVisible(True)
         self.connection_label.setText("Convite do seu mundo" if host else "Endereço no Minecraft")
         self.copy_button.setText("Copiar convite" if host else "Copiar endereço")
         self.copy_button.setEnabled(bool(self._code if host else self._address))
-        self.connection_hint.setText("Envie o convite para quem vai jogar. Mantenha seu mundo aberto."
+        self.connection_hint.setText("Envie o convite para quem vai jogar. Você decide quem entra."
                                      if host else "Minecraft → Multijogador → Conexão direta → cole o endereço.")
         self.session_heading.setText("Seu mundo está aberto." if host else "Preparando sua conexão…")
         self.peers_empty.setText("Aguardando quem vai jogar." if host else "Estabelecendo o caminho até o anfitrião…")
+        self._render_room_controls()
+        if not host:
+            self._render_guest_address()
         self._switch_page(self.session_page)
         self._update_guide()
 
@@ -790,6 +1010,9 @@ class MainWindow(QMainWindow):
         self._session = False
         self._code = ""
         self._address = ""
+        self._renewing_invite = False
+        self._peer_actions.clear()
+        self._clear_admissions()
         self._peers.clear()
         for row in self._peer_rows.values():
             self.peers_layout.removeWidget(row)
@@ -804,8 +1027,232 @@ class MainWindow(QMainWindow):
         self.peers_heading.setText("Na sessão")
         self.footer_label.setText("P2P direto · só a conexão do jogo")
         self.segment.show()
+        self._render_room_controls()
         self._set_busy(False)
         self._set_tab(self._role)
+
+    def _clear_admissions(self):
+        self._admissions.clear()
+        for row in self._admission_rows.values():
+            self.admissions_layout.removeWidget(row)
+            row.hide()
+            row.deleteLater()
+        self._admission_rows.clear()
+        self.admissions_section.hide()
+
+    def _render_room_controls(self):
+        host = self._role == "host" and self._session
+        can_act = host and self.stop_button.isEnabled()
+        self.renew_invite_button.setVisible(host)
+        self.renew_hint.setVisible(host)
+        self.renew_invite_button.setEnabled(can_act and not self._renewing_invite)
+        self.renew_invite_button.setText("Renovando…" if self._renewing_invite else "Renovar convite")
+        if host:
+            self.copy_button.setEnabled(can_act and bool(self._code) and not self._renewing_invite)
+        self.admissions_section.setVisible(host and bool(self._admissions))
+        self.admissions_heading.setText(f"Pedidos de entrada · {len(self._admissions)}")
+        for peer_id, row in self._admission_rows.items():
+            action = self._peer_actions.get(peer_id, "")
+            row.set_action_state(can_act and not action, action)
+        for peer_id, row in self._peer_rows.items():
+            row.set_manageable(host, peer_id in self._peer_actions or not can_act, self._peer_actions.get(peer_id, ""))
+        self.removal_hint.setVisible(host and any(
+            peer.get("state") in ("connecting", "connected") for peer in self._peers.values()))
+        self._render_trusted_controls()
+
+    def _render_guest_address(self):
+        if self._role != "guest":
+            return
+        ready = bool(self._address)
+        self.connection_label.setVisible(ready)
+        self.address_display.setVisible(ready)
+        self.copy_button.setVisible(ready)
+        self.copy_button.setEnabled(ready)
+        if ready:
+            self.connection_hint.setText("Minecraft → Multijogador → Conexão direta → cole o endereço.")
+        elif self._state == "waiting_approval":
+            self.connection_hint.setText("O endereço do Minecraft aparece depois que o anfitrião aprovar sua entrada.")
+        else:
+            self.connection_hint.setText("O endereço do Minecraft aparece quando a conexão estiver pronta.")
+
+    def _load_trusted_computers(self):
+        try:
+            self.controller.trusted_computers()
+        except Exception as exc:
+            self._trust_action_error(str(exc))
+
+    def _render_trusted_controls(self):
+        count = len(self._trusted_computers)
+        self.trusted_button.setText(f"Computadores de confiança ({count})")
+        self.trusted_button.setEnabled(self._role == "host")
+        self.trusted_session_button.setText(f"Confiança · {count}")
+        self.trusted_session_button.setAccessibleName(f"Gerenciar computadores de confiança, {count} salvos")
+        self.trusted_session_button.setVisible(self._role == "host" and self._session)
+
+    def _open_trusted_computers(self):
+        if self._role != "host":
+            return
+        if self._trusted_dialog is None:
+            dialog = QDialog(self)
+            dialog.setObjectName("trustedComputersDialog")
+            dialog.setWindowTitle("Computadores de confiança")
+            dialog.setMinimumSize(440, 300)
+            dialog.resize(510, 350)
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(24, 20, 24, 20)
+            layout.setSpacing(12)
+            layout.addWidget(_label("Computadores de confiança", role="heading"))
+            layout.addWidget(_label("Entram nas próximas salas com um convite válido, sem nova aprovação. Esquecer mantém a partida atual.", role="caption", wrap=True))
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.trusted_container = QWidget()
+            self.trusted_container.setObjectName("trustedComputersContainer")
+            self.trusted_layout = QVBoxLayout(self.trusted_container)
+            self.trusted_layout.setContentsMargins(0, 0, 4, 0)
+            self.trusted_layout.setSpacing(0)
+            self.trusted_empty = _label("Nenhum computador salvo. Marque “Confiar neste computador” ao aprovar uma entrada.", role="caption", wrap=True)
+            self.trusted_layout.addWidget(self.trusted_empty)
+            self.trusted_layout.addStretch(1)
+            scroll.setWidget(self.trusted_container)
+            layout.addWidget(scroll, 1)
+            self.trust_notice = _label("", role="caption", wrap=True, name="trustNotice")
+            self.trust_notice.hide()
+            layout.addWidget(self.trust_notice)
+            close_button = _button("Fechar", "closeTrustedComputersButton")
+            close_button.clicked.connect(dialog.close)
+            layout.addWidget(close_button, 0, Qt.AlignmentFlag.AlignRight)
+            self._trusted_dialog = dialog
+        self._render_trusted_list()
+        self.trust_notice.hide()
+        self._trusted_dialog.open()
+
+    def _render_trusted_list(self):
+        if self._trusted_dialog is None:
+            return
+        for row in self._trusted_rows.values():
+            self.trusted_layout.removeWidget(row)
+            row.hide()
+            row.deleteLater()
+        self._trusted_rows.clear()
+        for fingerprint, computer in self._trusted_computers.items():
+            row = TrustedComputerRow(computer, self._forget_trusted)
+            row.set_pending(fingerprint in self._forgetting)
+            self._trusted_rows[fingerprint] = row
+            self.trusted_layout.insertWidget(self.trusted_layout.count() - 1, row)
+        self.trusted_empty.setVisible(not self._trusted_computers)
+
+    def _set_peer_trusted(self, peer_id: str, trusted: bool):
+        peer = self._peers.get(peer_id, {})
+        if (self._role != "host" or not self._session or not self.stop_button.isEnabled()
+                or peer_id in self._peer_actions or peer.get("state") != "connected"
+                or not peer.get("can_trust") or not peer.get("fingerprint")):
+            return
+        self._peer_actions[peer_id] = "trust" if trusted else "untrust"
+        self._render_room_controls()
+        try:
+            self.controller.set_trusted(peer_id, bool(trusted))
+        except Exception as exc:
+            self._trust_action_error(str(exc), peer_id=peer_id)
+
+    def _forget_trusted(self, fingerprint: str):
+        if (self._role != "host" or fingerprint not in self._trusted_computers
+                or fingerprint in self._forgetting):
+            return
+        self._forgetting.add(fingerprint)
+        if fingerprint in self._trusted_rows:
+            self._trusted_rows[fingerprint].set_pending(True)
+        if self._trusted_dialog is not None:
+            self.trust_notice.hide()
+        try:
+            self.controller.forget_trusted(fingerprint)
+        except Exception as exc:
+            self._trust_action_error(str(exc), fingerprint=fingerprint)
+
+    def _trust_action_error(self, message: str, *, peer_id: str = "", fingerprint: str = ""):
+        if peer_id:
+            if self._peer_actions.get(peer_id) in ("trust", "untrust"):
+                self._peer_actions.pop(peer_id, None)
+        if fingerprint:
+            self._forgetting.discard(fingerprint)
+            if fingerprint in self._trusted_rows:
+                self._trusted_rows[fingerprint].set_pending(False)
+        self._render_room_controls()
+        if self._trusted_dialog is not None and self._trusted_dialog.isVisible():
+            self.trust_notice.setText(message)
+            self.trust_notice.show()
+        else:
+            self._show_notice(message, error=True)
+
+    def _handle_trusted(self, event: dict):
+        computers = event.get("computers") or []
+        self._trusted_computers = {
+            str(computer["fingerprint"]): dict(computer)
+            for computer in computers if isinstance(computer, dict) and computer.get("fingerprint")
+        }
+        self._forgetting.intersection_update(self._trusted_computers)
+        for peer_id, peer in self._peers.items():
+            fingerprint = str(peer.get("fingerprint") or "")
+            if not fingerprint or not peer.get("can_trust"):
+                continue
+            peer["trusted"] = fingerprint in self._trusted_computers
+            self._peer_rows[peer_id].update_peer(peer)
+            action = self._peer_actions.get(peer_id)
+            if (action == "trust" and peer["trusted"]) or (action == "untrust" and not peer["trusted"]):
+                self._peer_actions.pop(peer_id, None)
+        self._render_room_controls()
+        self._render_trusted_list()
+
+    def _admission_action(self, peer_id: str, action: str, remember: bool = False):
+        if (action not in ("approve", "reject") or self._role != "host"
+                or not self._session or not self.stop_button.isEnabled()
+                or peer_id not in self._admissions or peer_id in self._peer_actions):
+            return
+        self._peer_actions[peer_id] = action
+        self._render_room_controls()
+        try:
+            if action == "approve":
+                admission = self._admissions[peer_id]
+                remember = bool(remember and admission.get("can_trust") and admission.get("fingerprint"))
+                self.controller.approve(peer_id, remember)
+            else:
+                self.controller.reject(peer_id)
+        except Exception as exc:
+            self._room_action_error(str(exc), peer_id)
+
+    def _remove_peer(self, peer_id: str):
+        if (self._role != "host" or not self._session or not self.stop_button.isEnabled()
+                or peer_id in self._peer_actions
+                or self._peers.get(peer_id, {}).get("state") not in ("connecting", "connected")):
+            return
+        self._peer_actions[peer_id] = "remove"
+        self._render_room_controls()
+        try:
+            self.controller.remove_peer(peer_id)
+        except Exception as exc:
+            self._room_action_error(str(exc), peer_id)
+
+    def _renew_invite(self):
+        if (self._role != "host" or not self._session or not self.stop_button.isEnabled()
+                or self._renewing_invite):
+            return
+        self._renewing_invite = True
+        self._render_room_controls()
+        try:
+            self.controller.renew_invite()
+        except Exception as exc:
+            self._renewing_invite = False
+            self._room_action_error(str(exc), reset_peers=False)
+
+    def _room_action_error(self, message: str, peer_id: str = "", *, reset_peers: bool = True):
+        if reset_peers:
+            if peer_id:
+                self._peer_actions.pop(peer_id, None)
+            else:
+                self._peer_actions.clear()
+        self._render_room_controls()
+        self._show_notice(message or "A operação não foi concluída. Tente novamente.", error=True)
 
     def _host(self):
         if self._busy or self._session:
@@ -829,10 +1276,12 @@ class MainWindow(QMainWindow):
             return
         self._hide_notice()
         self._role = "guest"
+        name = self.guest_name.text().strip() or "Amigo"
+        self.settings.setValue("guest_name", name)
         self._set_busy(True)
         self._set_badge("Conectando", "busy")
         try:
-            self.controller.join(code, 0)
+            self.controller.join(code, 0, name)
         except Exception as exc:
             self._error(str(exc))
 
@@ -840,6 +1289,8 @@ class MainWindow(QMainWindow):
         if not self.stop_button.isEnabled():
             return
         self.stop_button.setEnabled(False)
+        self._clear_admissions()
+        self._render_room_controls()
         self._set_badge("Encerrando", "busy")
         try:
             self.controller.stop()
@@ -1020,7 +1471,9 @@ class MainWindow(QMainWindow):
         if not isinstance(event, dict):
             return
         kind = event.get("type")
-        if kind == "update":
+        if kind == "trusted":
+            self._handle_trusted(event)
+        elif kind == "update":
             self._handle_update(event)
         elif kind == "status":
             state = str(event.get("state", "idle"))
@@ -1042,6 +1495,13 @@ class MainWindow(QMainWindow):
                     self._begin_session()
                 elif not self._session:
                     self._set_busy(True)
+            elif state == "waiting_approval":
+                if not self._session:
+                    self._begin_session()
+                self._set_badge("Aguardando anfitrião", "busy")
+                self.session_heading.setText("Aguardando aprovação do anfitrião.")
+                self.peers_empty.setText("Seu pedido foi enviado. Aguarde a aprovação para entrar.")
+                self._render_guest_address()
             elif state == "connected":
                 if not self._session:
                     self._begin_session()
@@ -1058,28 +1518,64 @@ class MainWindow(QMainWindow):
             self.code_display.setPlainText(self._code)
             if not self._session:
                 self._begin_session()
-            self.copy_button.setEnabled(bool(self._code if self._role == "host" else self._address))
+            if event.get("renewed"):
+                self._renewing_invite = False
+                self._show_notice("Convite renovado. O anterior deixou de valer; quem já entrou continua.", transient=True)
+            self._render_room_controls()
+            if self._role == "guest":
+                self._render_guest_address()
+        elif kind == "room_action":
+            self._renewing_invite = event.get("state") == "renewing"
+            self._render_room_controls()
         elif kind == "listening":
             self._address = str(event.get("address") or "")
             self.address_display.setText(self._address)
             if self._role == "guest":
                 if not self._session:
                     self._begin_session()
-                self.copy_button.setEnabled(bool(self._address))
+                self._render_guest_address()
+        elif kind == "admission":
+            peer_id = str(event.get("peer_id") or "")
+            if not peer_id or self._role != "host" or not self._session or not self.stop_button.isEnabled():
+                return
+            if event.get("state") == "pending":
+                self._admissions.setdefault(peer_id, {}).update(event)
+                if peer_id not in self._admission_rows:
+                    row = AdmissionRow(self._admissions[peer_id], self._admission_action)
+                    self._admission_rows[peer_id] = row
+                    self.admissions_layout.addWidget(row)
+                else:
+                    self._admission_rows[peer_id].update_admission(self._admissions[peer_id])
+            elif event.get("state") in ("approved", "rejected", "expired", "cancelled"):
+                self._admissions.pop(peer_id, None)
+                self._peer_actions.pop(peer_id, None)
+                row = self._admission_rows.pop(peer_id, None)
+                if row is not None:
+                    self.admissions_layout.removeWidget(row)
+                    row.hide()
+                    row.deleteLater()
+            self._render_room_controls()
         elif kind == "peer":
             peer_id = str(event.get("peer_id") or "unknown")
             self._peers.setdefault(peer_id, {}).update(event)
             peer = self._peers[peer_id]
             if peer_id not in self._peer_rows:
-                row = PeerRow(peer)
+                row = PeerRow(peer, on_remove=self._remove_peer, on_trust=self._set_peer_trusted)
                 row.setObjectName(f"peer_{peer_id}")
                 self._peer_rows[peer_id] = row
                 self.peers_layout.insertWidget(self.peers_layout.count() - 1, row)
             else:
                 self._peer_rows[peer_id].update_peer(peer)
+            if peer.get("state") in ("disconnected", "failed"):
+                self._peer_actions.pop(peer_id, None)
+            elif "trusted" in event:
+                action = self._peer_actions.get(peer_id)
+                if (action == "trust" and peer.get("trusted")) or (action == "untrust" and not peer.get("trusted")):
+                    self._peer_actions.pop(peer_id, None)
             self.peers_empty.hide()
             active = sum(p.get("state") == "connected" for p in self._peers.values())
             self.peers_heading.setText(f"Na sessão · {active}" if active else "Na sessão")
+            self._render_room_controls()
         elif kind == "metrics":
             sent = int(event.get("sent") or 0)
             received = int(event.get("received") or 0)
@@ -1117,8 +1613,14 @@ class MainWindow(QMainWindow):
                 self.scan_button.setText("Buscar")
                 self.scan_hint.setText("Você pode informar a porta mostrada no chat do jogo.")
                 self._show_notice(message, error=True)
-            elif operation == "peer":
-                self._show_notice(message, error=True)
+            elif operation == "trust":
+                self._trust_action_error(message, peer_id=str(event.get("peer_id") or ""),
+                                         fingerprint=str(event.get("fingerprint") or ""))
+            elif operation in ("peer", "room"):
+                peer_id = str(event.get("peer_id") or "")
+                if operation == "room" and not peer_id:
+                    self._renewing_invite = False
+                self._room_action_error(message, peer_id, reset_peers=operation == "peer" or bool(peer_id))
             else:
                 self._error(message)
         elif kind == "diagnostics":
@@ -1139,6 +1641,8 @@ class MainWindow(QMainWindow):
             self.modpack_detail.setVisible(not compact)
 
     def closeEvent(self, event):
+        if self._trusted_dialog is not None:
+            self._trusted_dialog.close()
         try:
             self.controller.stop()
         except Exception:

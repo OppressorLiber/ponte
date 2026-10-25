@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from pontelan import core
+from pontelan.identity import Identity, TrustStore
 
 
 class FakeWriter:
@@ -89,7 +90,7 @@ class FakeReader:
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_during_host_tcp_validation_does_not_open_room(self):
         events = []
-        service = core.TunnelService(events.append, stun=False)
+        service = core.TunnelService(events.append, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
         entered, release = asyncio.Event(), asyncio.Event()
         writer = FakeWriter()
 
@@ -118,7 +119,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def _stop_during_signal_start(self, role):
         events = []
-        service = core.TunnelService(events.append, stun=False)
+        service = core.TunnelService(events.append, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
         buses = []
         writers = []
         bus_created = asyncio.Event()
@@ -180,7 +181,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self._stop_during_signal_start("guest")
 
     async def test_old_peer_close_does_not_remove_replacement(self):
-        service = core.TunnelService(lambda event: None, stun=False)
+        service = core.TunnelService(lambda event: None, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
         entered, release = asyncio.Event(), asyncio.Event()
 
         async def close_pc():

@@ -10,7 +10,9 @@ import uuid
 from aiohttp import web
 
 from pontelan.core import TunnelService, direct_description
+from pontelan.identity import Identity, TrustStore
 from pontelan.discovery import parse_announcement
+from qa_transport import approve_fixture_request
 
 if os.name == 'nt':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -47,6 +49,8 @@ class LocalNtfy:
                     item = await asyncio.wait_for(queue.get(), .5)
                 except asyncio.TimeoutError:
                     item = {'event': 'keepalive'}
+                if item is None:
+                    break
                 await response.write((json.dumps(item)+'\n').encode())
         except (ConnectionError, asyncio.CancelledError):
             pass
@@ -66,6 +70,12 @@ class LocalNtfy:
         return web.json_response(item)
 
     async def close(self):
+        for queues in list(self.subscribers.values()):
+            for queue in list(queues):
+                queue.put_nowait(None)
+        async with asyncio.timeout(2):
+            while any(self.subscribers.values()):
+                await asyncio.sleep(.01)
         await self.runner.cleanup()
 
 
@@ -83,8 +93,8 @@ class TunnelTests(unittest.IsolatedAsyncioTestCase):
         self.signaling = LocalNtfy()
         await self.signaling.start()
         self.host_events, self.guest_events = [], []
-        self.host = TunnelService(self.host_events.append, endpoint=self.signaling.url, stun=False)
-        self.guest = TunnelService(self.guest_events.append, endpoint=self.signaling.url, stun=False)
+        self.host = TunnelService(self.host_events.append, endpoint=self.signaling.url, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
+        self.guest = TunnelService(self.guest_events.append, endpoint=self.signaling.url, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
         self.game = await asyncio.start_server(self.game_handler, '127.0.0.1', 0)
         self.game_port = self.game.sockets[0].getsockname()[1]
         self.game_tasks = set()
@@ -116,6 +126,7 @@ class TunnelTests(unittest.IsolatedAsyncioTestCase):
     async def connect(self):
         code = await self.host.host(self.game_port, 'Mundo modpack')
         await self.guest.join(code)
+        await approve_fixture_request(self.host)
         event = await wait_event(self.guest_events, lambda e: e['type'] == 'listening')
         self.assertTrue(event['address'].startswith('127.0.0.1:'))
         return int(event['address'].split(':')[1])
@@ -152,9 +163,10 @@ class TunnelTests(unittest.IsolatedAsyncioTestCase):
             await self.host.host(0)
         port = await self.connect()
         other_events = []
-        other = TunnelService(other_events.append, endpoint=self.signaling.url, stun=False)
+        other = TunnelService(other_events.append, endpoint=self.signaling.url, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
         try:
             await other.join(self.host.code)
+            await approve_fixture_request(self.host)
             event = await wait_event(other_events, lambda e: e['type'] == 'listening')
             other_port = int(event['address'].split(':')[1])
             await asyncio.gather(self.exchange(port, b'first'), self.exchange(other_port, b'second'))

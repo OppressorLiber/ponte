@@ -24,6 +24,7 @@ import time
 import textwrap
 
 from pontelan import core
+from pontelan.identity import Identity, TrustStore
 from pontelan.latency import summary
 import qa_baseline_022 as baseline_022
 
@@ -271,6 +272,14 @@ async def close_writer(writer):
         await asyncio.wait_for(writer.wait_closed(), .75)
 
 
+async def approve_fixture_request(host):
+    """Explicit consent for isolated fixtures; production always asks the host."""
+    async with asyncio.timeout(20):
+        while not host.pending_requests:
+            await asyncio.sleep(.01)
+        await host.approve(next(iter(host.pending_requests)))
+
+
 async def wait_for_listener(service, events):
     async with asyncio.timeout(15):
         while not service.local_port:
@@ -480,10 +489,11 @@ async def run_arm(mode, mbps, rtt_ms, candidate_window, repetition, max_seconds,
     restore_release = install_release_trace(core.DeliveryWindow, delivery_adjustments, arm_started)
     try:
         server = await asyncio.start_server(fixture, "127.0.0.1", 0)
-        host = core.TunnelService(lambda event: None, stun=False)
-        guest = core.TunnelService(events.append, stun=False)
+        host = core.TunnelService(lambda event: None, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
+        guest = core.TunnelService(events.append, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
         await host.host(server.sockets[0].getsockname()[1], "Controlled benchmark")
         await guest.join(host.code)
+        await approve_fixture_request(host)
         await wait_for_listener(guest, events)
         peer = guest.peers["host"]
         result["route"] = peer.route()
