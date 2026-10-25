@@ -23,7 +23,28 @@ Quem ainda usa **0.1.0** precisa baixar a versão mais recente uma vez, pois aqu
 
 ### Indicador de latência
 
-A versão **0.2.1** usa relógio de alta precisão. Valores menores que um milissegundo aparecem como `<1 ms`; amostras antigas deixam de ser apresentadas como atuais. O número mede a ida e volta do aplicativo, incluindo filas e processamento, e pode variar sem causar travadas no jogo. Passe o mouse sobre a latência de um participante para ver mediana e p95; o diagnóstico inclui o histórico recente, timeouts de sondas e atraso do loop local. Timeout de uma sonda não representa uma porcentagem de perda de pacotes da rede.
+A versão **0.2.1** usa relógio de alta precisão. Valores menores que um milissegundo aparecem como `<1 ms`; amostras antigas deixam de ser apresentadas como atuais. O número mede a ida e volta do aplicativo, incluindo filas e processamento. Uma medição isolada não identifica a causa de um pico. Passe o mouse sobre a latência de um participante para ver mediana e p95; o diagnóstico inclui o histórico recente, timeouts de sondas e atraso do loop local. Timeout de uma sonda não representa uma porcentagem de perda de pacotes da rede.
+
+### Menos fila antes do envio — 0.2.3
+
+O envio dos dados agora aguarda espaço quando os buffers locais dos DataChannels estão ocupados. O limite de admissão é 16 KiB compartilhado entre as conexões; dados já entregues ao SCTP continuam usando seu controle de congestionamento e a janela adaptativa de créditos da 0.2.2. Isso evita acumular uma fila grande antes de o transporte conseguir transmiti-la. Não é um limite fixo de velocidade em Mbit/s.
+
+Conexões canceladas continuam contabilizadas enquanto seus dados pendentes drenam. A medição de confirmação começa no envio efetivo. Encerrar a sala também cancela os transportes TCP ativos ou pausados, evitando esperar indefinidamente por um cliente. O encerramento normal de cada fluxo mantém os bytes e o half-close.
+
+Comparação com o transporte publicado da **0.2.2**, congelado no teste, usando TCP/ICE/DTLS/SCTP reais e transferências simultâneas de 1 MB por direção:
+
+| Caminho simulado | p95 0.2.2 → 0.2.3 | Upload | Download |
+|---|---:|---:|---:|
+| 2 Mbit/s por sentido, RTT 40 ms | 944 → 386 ms | +5,5% | +3,5% |
+| 20 Mbit/s por sentido, RTT 100 ms | 846 → 565 ms | +22,7% | +19,0% |
+
+São médias dos resultados de duas repetições por cenário, com ordem invertida. Os oito braços passaram: 16 MB conferidos por SHA-256 e 390 respostas TCP íntegras, sem timeouts. As amostras de fila local caíram de aproximadamente 119–123 KiB para 12–13 KiB. O limite de admissão considera os buffers públicos; mensagens de controle, créditos, FIN e dados internos/em trânsito no SCTP têm contabilização própria.
+
+Testes adicionais de 4 MB por direção verificaram integridade. A carga do PC variou nesses ensaios, com atraso do loop chegando a 171 ms. Uma checagem adicional em processos novos, com atraso de loop abaixo de 15 ms, mediu upload de 6,41 → 7,38 Mbit/s e download de 6,63 → 7,59 Mbit/s; é apenas um par de execuções e não uma promessa de ganho contínuo. Num ensaio adicional com perda simulada de 0,3% e atraso extra uniforme de 0–5 ms por datagrama, a candidata completou os dois cenários com hashes e sondas corretos. A referência atingiu o limite de 30 s com upload incompleto em ambos; não calculamos melhora percentual contra esses braços incompletos. Esse modelo pode reordenar datagramas e usa uma única semente.
+
+Todos esses ensaios são no mesmo PC, com um caminho moldado. O ganho entre as redes dos jogadores ainda precisa ser confirmado. Os relatórios brutos e os limites das medições acompanham a release.
+
+Para reproduzir a comparação principal: `python qa_transport.py --baseline 0.2.2 --repetitions 2 --bulk-bytes 1000000 --max-seconds 20 --output qa-comparacao.json`. A candidata usa os valores de produção; `--candidate-window` é uma opção exploratória, não necessária para reproduzir a versão publicada.
 
 ### Transporte sob carga — 0.2.2
 

@@ -17,6 +17,7 @@ from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSession
 from .signaling import SignalBus, new_code, normalize_code
 from .latency import LatencySamples, summary
 from .flow import DeliveryWindow
+from .send_buffer import SendBuffer
 
 LOG = logging.getLogger(__name__)
 CHUNK = 16384
@@ -40,6 +41,13 @@ def safe_name(name: str) -> str:
     return "".join(c for c in str(name) if c.isprintable())[:60].strip() or "Meu mundo"
 
 
+def outgoing_buffered(peer):
+    channels = [stream.channel for stream in peer.streams]
+    if getattr(peer, "control", None) is not None:
+        channels.append(peer.control)
+    return sum(channel.bufferedAmount for channel in channels if channel.readyState == "open")
+
+
 class StreamBridge:
     """Preserve bytes and half-close; receive credits bound memory on slow clients."""
 
@@ -54,6 +62,8 @@ class StreamBridge:
         self.pending_times = deque()
         if not hasattr(peer, "delivery"):
             peer.delivery = DeliveryWindow(PEER_SEND_BUDGET, quantum=SEND_CHUNK)
+        if not hasattr(peer, "send_buffer"):
+            peer.send_buffer = SendBuffer(lambda: outgoing_buffered(peer))
         self.queued_bytes = 0
         self.queued_frames = 0
         self.eof_acked = asyncio.Event()
@@ -61,7 +71,9 @@ class StreamBridge:
         self.sent_eof = False
         self.closed = False
         self.task = None
-        channel.bufferedAmountLowThreshold = WINDOW // 2
+        channel.bufferedAmountLowThreshold = 0
+        channel.on("bufferedamountlow", peer.send_buffer.changed.set)
+        channel.on("close", peer.send_buffer.changed.set)
         channel.on("open", self.opened.set)
         channel.on("message", self._message)
         channel.on("close", self._channel_closed)
@@ -165,8 +177,8 @@ class StreamBridge:
                 return
             self.credit -= len(data)
             self.pending_sizes.append(len(data))
-            self.pending_times.append(time.perf_counter())
-            self.channel.send(b"\x00" + data)
+            sent_at = await self.peer.send_buffer.send(self.channel, b"\x00" + data)
+            self.pending_times.append(sent_at)
             self.peer.owner.sent += len(data)
             # Give small requests, credit replies and other TCP flows a turn.
             await asyncio.sleep(0)
@@ -206,6 +218,7 @@ class StreamBridge:
         if self.closed:
             return
         self.closed = True
+        self.peer.send_buffer.retire(self.channel)
         self.peer.delivery.forget(self)
         self.opened.set()
         self.credit_changed.set()
@@ -226,6 +239,7 @@ class TunnelPeer:
         self.control = None
         self.streams = set()
         self.delivery = DeliveryWindow(PEER_SEND_BUDGET, quantum=SEND_CHUNK)
+        self.send_buffer = SendBuffer(lambda: outgoing_buffered(self))
         self.ready = asyncio.Event()
         self.closed = False
         self.rtt_ms = None
@@ -279,6 +293,9 @@ class TunnelPeer:
 
     def _control(self, channel):
         self.control = channel
+        channel.bufferedAmountLowThreshold = 0
+        channel.on("bufferedamountlow", self.send_buffer.changed.set)
+        channel.on("close", self.send_buffer.changed.set)
         channel.on("message", self._control_message)
         channel.on("open", self._opened)
         channel.on("close", lambda: asyncio.create_task(self._lost()) if not self.closed else None)
@@ -360,8 +377,11 @@ class TunnelPeer:
             return
         self.closed = True
         for stream in list(self.streams):
+            if stream.writer:
+                stream.writer.transport.abort()
             stream.close()
         self.delivery.close()
+        self.send_buffer.close()
         for task in (self.ping_task, self.connect_task):
             if task and task is not asyncio.current_task():
                 task.cancel()
@@ -595,10 +615,9 @@ class TunnelService:
         self.generation += 1
         self.starting = False
         self.stopping = True
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
-            self.server = None
+        server, self.server = self.server, None
+        if server:
+            server.close()
         for task in list(self.tasks):
             if task is not asyncio.current_task():
                 task.cancel()
@@ -607,6 +626,10 @@ class TunnelService:
         for peer in list(self.peers.values()):
             await peer.close()
         self.peers.clear()
+        if server:
+            # Python 3.12 also waits for accepted transports here. Close the
+            # peers first so a game socket cannot keep shutdown waiting.
+            await server.wait_closed()
         if self.metrics_task:
             self.metrics_task.cancel()
             await asyncio.gather(self.metrics_task, return_exceptions=True)

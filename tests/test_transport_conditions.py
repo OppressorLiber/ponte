@@ -30,6 +30,7 @@ class TransportConditionsTests(unittest.IsolatedAsyncioTestCase):
         self.fixture_tasks = set()
         self.fixture_writers = set()
         self.client_writers = []
+        self.stop_tasks = []
         self.server = None
         self.resume = asyncio.Event()
         self.stalled = asyncio.Event()
@@ -43,19 +44,28 @@ class TransportConditionsTests(unittest.IsolatedAsyncioTestCase):
         self.resume.set()
         for writer in self.client_writers:
             writer.transport.abort()
+        for writer in list(self.fixture_writers):
+            writer.transport.abort()
         # A failed paused-reader test can leave accepted sockets blocked on
         # admission. Close their peers before waiting for the local listener.
         for service in reversed(self.services):
             for peer in list(service.peers.values()):
+                for bridge in list(peer.streams):
+                    if bridge.writer:
+                        bridge.writer.transport.abort()
                 await asyncio.wait_for(peer.close(), 5)
+        for task in self.stop_tasks:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), 5)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
         for service in reversed(self.services):
             await asyncio.wait_for(service.stop(), 5)
         if self.server:
             self.server.close()
-            await self.server.wait_closed()
-        for writer in list(self.fixture_writers):
-            writer.transport.resume_reading()
-            writer.close()
+            await asyncio.wait_for(self.server.wait_closed(), 5)
         for task in list(self.fixture_tasks):
             task.cancel()
         await asyncio.gather(*list(self.fixture_tasks), return_exceptions=True)
@@ -163,6 +173,58 @@ class TransportConditionsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_current_host_sender_with_legacy_guest_sender_preserves_half_close_and_hashes(self):
         await self.compatibility('guest')
+
+    async def test_stop_closes_active_tcp_without_waiting_for_client_eof(self):
+        await self.connect()
+        _, writer = await asyncio.open_connection('127.0.0.1', self.guest.local_port)
+        self.client_writers.append(writer)
+        request = b'Econnection remains open'
+        writer.write(request)
+        await writer.drain()
+        async with asyncio.timeout(5):
+            while self.host.received < len(request):
+                await asyncio.sleep(.01)
+        self.assertFalse(writer.is_closing())
+        peer = self.guest.peers['host']
+        self.assertTrue(peer.streams)
+        listener = self.guest.server
+        stopping = asyncio.create_task(self.guest.stop())
+        self.stop_tasks.append(stopping)
+        try:
+            await asyncio.wait_for(asyncio.shield(stopping), 1)
+        except TimeoutError:
+            self.fail('stop() waited for the accepted TCP client to close before closing its peer')
+        self.assertIsNone(self.guest.server)
+        self.assertFalse(listener.is_serving())
+        self.assertFalse(self.guest.peers)
+        self.assertIsNone(self.guest.bus)
+
+    async def test_stop_aborts_paused_destination_without_waiting_for_reader_resume(self):
+        await self.connect()
+        _, writer = await asyncio.open_connection('127.0.0.1', self.guest.local_port)
+        self.client_writers.append(writer)
+        writer.write(b'S' + os.urandom(1 << 20))
+        await asyncio.wait_for(self.stalled.wait(), 10)
+        async with asyncio.timeout(10):
+            while not (self.stalled_bridge.writer.transport.get_write_buffer_size() > 8192
+                       and self.stalled_bridge.queued_bytes > 0):
+                if self.fixture_errors:
+                    self.fail(str(self.fixture_errors))
+                await asyncio.sleep(.01)
+        self.assertFalse(self.resume.is_set())
+        self.assertFalse(writer.is_closing())
+        bridge = self.stalled_bridge
+        stopping = asyncio.create_task(self.host.stop())
+        self.stop_tasks.append(stopping)
+        await asyncio.wait_for(asyncio.shield(stopping), 1)
+        try:
+            await asyncio.wait_for(asyncio.shield(bridge.task), 1)
+        except TimeoutError:
+            self.fail('stopped tunnel left bridge.run waiting for a paused TCP writer to drain')
+        self.assertFalse(self.resume.is_set())
+        self.assertTrue(bridge.closed)
+        self.assertTrue(bridge.writer.transport.is_closing())
+        self.assertFalse(self.host.peers)
 
     async def test_real_stalled_destination_allows_unrelated_echo_then_resumes_exact_bytes(self):
         await self.connect()
