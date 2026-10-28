@@ -195,7 +195,6 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         closing = asyncio.create_task(old_peer.close())
         try:
             await asyncio.wait_for(entered.wait(), 1)
-            await service.stop()
             replacement = object()
             service.peers["host"] = replacement
             release.set()

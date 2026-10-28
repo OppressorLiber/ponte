@@ -1,7 +1,7 @@
-"""Controlled same-PC TCP/ICE/DTLS/SCTP A/B; never attaches to a user's room.
+"""Controlled same-PC TCP over WebRTC or QUIC A/B; isolated fixture rooms.
 
 Signaling uses its real authenticated envelope, delivered in memory instead of
-HTTP. A FIFO rate/delay shaper wraps actual ICE UDP transports after DTLS is up.
+HTTP. A FIFO rate/delay shaper wraps actual ICE UDP after authentication is up.
 All latency probes are 64-byte TCP request/response traffic through the tunnel.
 """
 from __future__ import annotations
@@ -25,11 +25,19 @@ import textwrap
 
 from pontelan import core
 from pontelan.identity import Identity, TrustStore
+from pontelan.event_loop import NetworkEventLoop
 from pontelan.latency import summary
 import qa_baseline_022 as baseline_022
 
 
 REAL_BUS = core.SignalBus
+BASELINE_024_SOURCE = {
+    "revision": "3f9f0f44439496dbb98d35cf2a8737d6ce993bcf",
+    "stream_read_sha256": "f84e97aef9e87410e5d6fbbf58d693e28b809dda793af025c22db5cdceabdc12",
+    "delivery_window_sha256": "b11c7f59c080e4df46b5c5093f4f24035712a83093364afeab7517f322dd8adf",
+    "flow_sha256": "72f489511df7e7e64c1ef3d09c19291ed9af5b7fd7a9c7c578d7c808c448967e",
+    "send_buffer_sha256": "cace028b0117047b9ef06aff18abd38358add818cb131d6e4023412e57018397",
+}
 
 
 class MemorySignalBus(REAL_BUS):
@@ -141,10 +149,11 @@ def install_config(mode, candidate_window=None, baseline="legacy"):
     """Install only this arm's transport configuration; restore exact objects.
 
     The legacy comparison remains the default. 0.2.2 freezes the published
-    sender, admission class and constants. Candidate uses unmodified production
+    sender, admission class and constants. 0.2.4 verifies that the shared sender
+    and admission components still match that release. Candidate uses production
     unless an explicit exploratory initial-budget override was requested.
     """
-    if mode not in ("baseline", "candidate") or baseline not in ("legacy", "0.2.2"):
+    if mode not in ("baseline", "candidate") or baseline not in ("legacy", "0.2.2", "0.2.4"):
         raise ValueError("Unknown benchmark arm or baseline")
     original = core.StreamBridge._read
     absent = object()
@@ -159,6 +168,8 @@ def install_config(mode, candidate_window=None, baseline="legacy"):
         replace("DeliveryWindow", baseline_022.DeliveryWindow)
         for name in ("CHUNK", "SEND_CHUNK", "PEER_SEND_BUDGET", "WINDOW"):
             replace(name, getattr(baseline_022, name))
+    elif mode == "baseline" and baseline == "0.2.4":
+        verify_baseline_024()
     elif mode == "baseline":
         core.StreamBridge._read = original_read
         if hasattr(core, "PEER_SEND_BUDGET"):
@@ -181,6 +192,55 @@ def install_config(mode, candidate_window=None, baseline="legacy"):
 
 def source_fingerprint(value):
     return hashlib.sha256(textwrap.dedent(inspect.getsource(value)).rstrip().encode()).hexdigest()
+
+
+def verify_baseline_024():
+    """Fail explicitly if the shared 0.2.4 sender/admission snapshot drifts."""
+    actual = {"stream_read_sha256": source_fingerprint(core.StreamBridge._read),
+              "delivery_window_sha256": source_fingerprint(core.DeliveryWindow)}
+    for name in ("flow", "send_buffer"):
+        source = Path(core.__file__).with_name(name + ".py").read_text(encoding="utf-8")
+        actual[name + "_sha256"] = hashlib.sha256(source.encode()).hexdigest()
+    constants = (core.CHUNK, core.SEND_CHUNK, core.PEER_SEND_BUDGET, core.WINDOW)
+    if constants != (16384, 4096, 131072, 262144) or any(
+            actual[name] != BASELINE_024_SOURCE[name] for name in actual):
+        raise ValueError("The shared sender/admission no longer matches published 0.2.4")
+
+
+def arm_transport(mode, candidate_transport="webrtc"):
+    if mode not in ("baseline", "candidate") or candidate_transport not in ("webrtc", "quic"):
+        raise ValueError("Unknown benchmark arm or candidate transport")
+    return candidate_transport if mode == "candidate" else "webrtc"
+
+
+def connection_metadata(peer):
+    transport = getattr(peer, "transport", "webrtc")
+    secure_state = peer.pc.connectionState if transport == "quic" else peer.pc.sctp.transport.state
+    return {"transport": transport,
+            "transport_name": "QUIC / TLS 1.3" if transport == "quic" else "WebRTC / SCTP",
+            "secure_transport_state": secure_state,
+            "secure_transport_protocol": "TLS 1.3" if transport == "quic" else "DTLS",
+            # Preserve existing consumers of this field; protocol labels above
+            # make its compatibility meaning explicit for a QUIC arm.
+            "dtls_state": secure_state,
+            "sctp_state": "not_applicable" if transport == "quic" else peer.pc.sctp.state,
+            "scope": ("same PC, real TCP/ICE/TLS/QUIC; configured UDP FIFO impairment; not remote-friend evidence"
+                      if transport == "quic" else
+                      "same PC, real TCP/ICE/DTLS/SCTP; configured UDP FIFO impairment; not remote-friend evidence")}
+
+
+def ice_protocols(peer):
+    connection = (peer.pc._ice if getattr(peer, "transport", "webrtc") == "quic"
+                  else peer.pc.sctp.transport.transport._connection)
+    return connection._protocols
+
+
+def event_loop_metadata():
+    loop = asyncio.get_running_loop()
+    return {"class": type(loop).__module__ + "." + type(loop).__qualname__,
+            "time_function": loop.time.__qualname__,
+            "resolution_seconds": loop._clock_resolution,
+            "implementation": time.get_clock_info("perf_counter").implementation}
 
 
 def install_release_trace(window_class, records, arm_started, clock=time.perf_counter):
@@ -227,7 +287,10 @@ def probe_series(probe, arm_started, loaded_start, loaded_end):
 
 
 def sctp_diagnostics(peer):
-    """Private aiortc counters are QA-only, optional, and contain no payload/IP."""
+    """Optional native counters for this arm, without payloads or addresses."""
+    if getattr(peer, "transport", "webrtc") == "quic":
+        return {"transport": "quic", **{key: value for key, value in peer.pc.diagnostics().items()
+                                        if type(value) in (int, float) and math.isfinite(value)}}
     sctp = getattr(getattr(peer, "pc", None), "sctp", None)
     if sctp is None:
         return {}
@@ -282,10 +345,16 @@ async def approve_fixture_request(host):
 
 async def wait_for_listener(service, events):
     async with asyncio.timeout(15):
-        while not service.local_port:
+        while True:
             error = next((e for e in events if e.get("type") == "error"), None)
             if error:
                 raise ConnectionError(error.get("message"))
+            peer = service.peers.get("host")
+            if (service.server is not None and service.local_port and peer
+                    and peer.ready.is_set() and peer.control is not None
+                    and peer.control.readyState == "open"
+                    and any(event.get("type") == "listening" for event in events)):
+                return
             await asyncio.sleep(.01)
 
 
@@ -345,7 +414,9 @@ class TCPProbes:
 
 
 async def run_arm(mode, mbps, rtt_ms, candidate_window, repetition, max_seconds, bulk_bytes=0,
-                  baseline="legacy", loss_percent=0, jitter_ms=0, seed=20261024, checkpoint=None):
+                  baseline="legacy", loss_percent=0, jitter_ms=0, seed=20261024, checkpoint=None,
+                  candidate_transport="webrtc"):
+    transport = arm_transport(mode, candidate_transport)
     restore_config = install_config(mode, candidate_window, baseline)
     original_bus, core.SignalBus = core.SignalBus, MemorySignalBus
     events, fixture_tasks, fixture_writers = [], set(), set()
@@ -459,6 +530,7 @@ async def run_arm(mode, mbps, rtt_ms, candidate_window, repetition, max_seconds,
         snapshot("five seconds after deadline watchdog")
 
     result = {"mode": mode, "repetition": repetition, "capacity_mbps_per_direction": mbps,
+              "transport": transport, "event_loop": event_loop_metadata(),
               "configured_rtt_ms": rtt_ms, "configured_packet_loss_percent": loss_percent,
               "configured_extra_jitter_ms": jitter_ms, "impairment_seed": seed,
               "baseline": baseline if mode == "baseline" else None,
@@ -468,7 +540,9 @@ async def run_arm(mode, mbps, rtt_ms, candidate_window, repetition, max_seconds,
               "receive_credit_window_bytes": core.WINDOW,
               "effective_stream_read_sha256": source_fingerprint(core.StreamBridge._read),
               "effective_delivery_window_sha256": source_fingerprint(core.DeliveryWindow),
-              "scope": "same PC, real TCP/ICE/DTLS/SCTP; configured UDP FIFO impairment; not remote-friend evidence",
+              "scope": ("same PC, real TCP/ICE/TLS/QUIC; configured UDP FIFO impairment; not remote-friend evidence"
+                        if transport == "quic" else
+                        "same PC, real TCP/ICE/DTLS/SCTP; configured UDP FIFO impairment; not remote-friend evidence"),
               "signaling": "authenticated real signaling codec with in-memory delivery; no HTTP", "passed": False}
     arm_started = time.perf_counter()
 
@@ -489,19 +563,20 @@ async def run_arm(mode, mbps, rtt_ms, candidate_window, repetition, max_seconds,
     restore_release = install_release_trace(core.DeliveryWindow, delivery_adjustments, arm_started)
     try:
         server = await asyncio.start_server(fixture, "127.0.0.1", 0)
-        host = core.TunnelService(lambda event: None, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
-        guest = core.TunnelService(events.append, stun=False, identity=Identity.generate(), trust_store=TrustStore.in_memory())
+        host = core.TunnelService(lambda event: None, stun=False, identity=Identity.generate(),
+                                  trust_store=TrustStore.in_memory(), transport=transport)
+        guest = core.TunnelService(events.append, stun=False, identity=Identity.generate(),
+                                   trust_store=TrustStore.in_memory(), transport=transport)
         await host.host(server.sockets[0].getsockname()[1], "Controlled benchmark")
         await guest.join(host.code)
         await approve_fixture_request(host)
         await wait_for_listener(guest, events)
         peer = guest.peers["host"]
         result["route"] = peer.route()
-        result["dtls_state"] = peer.pc.sctp.transport.state
-        result["sctp_state"] = peer.pc.sctp.state
+        result.update(connection_metadata(peer))
         for service in (host, guest):
             for remote in service.peers.values():
-                for protocol in remote.pc.sctp.transport.transport._connection._protocols:
+                for protocol in ice_protocols(remote):
                     wrappers.append(ShapedUDP(protocol, mbps * 1e6 / 8, rtt_ms / 2000,
                                               loss_percent=loss_percent, jitter_ms=jitter_ms,
                                               seed=seed + len(wrappers)))
@@ -556,9 +631,10 @@ async def run_arm(mode, mbps, rtt_ms, candidate_window, repetition, max_seconds,
                                 "send_errors": sum(w.send_errors for w in wrappers),
                                 "maximum_fifo_queue_ms": round(max(w.maximum_queue_ms for w in wrappers), 2)}
         result["loop_lag"] = guest.diagnostics().get("event_loop_lag")
-        result["sctp_loaded"] = {name: {"sample_period_seconds": .1,
-                                        "extrema": series_extrema(samples), "series": samples}
-                                 for name, samples in transport_samples.items()}
+        result["transport_loaded"] = {name: {"transport": transport, "sample_period_seconds": .1,
+                                              "extrema": series_extrema(samples), "series": samples}
+                                       for name, samples in transport_samples.items()}
+        result["quic_loaded" if transport == "quic" else "sctp_loaded"] = result["transport_loaded"]
         result["delivery_window_loaded"] = {}
         for name, samples in delivery_samples.items():
             if samples:
@@ -573,7 +649,7 @@ async def run_arm(mode, mbps, rtt_ms, candidate_window, repetition, max_seconds,
         result["passed"] = (all(result.get(name, {}).get("hash_verified") for name in ("upload", "download"))
                             and not probe.invalid and not probe.timeouts
                             and result["loaded_tcp_request_response"]["count"] >= 3
-                            and result["dtls_state"] == "connected"
+                            and result["secure_transport_state"] == "connected"
                             and not result["udp_shaper"]["send_errors"])
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -642,18 +718,44 @@ async def run_arm(mode, mbps, rtt_ms, candidate_window, repetition, max_seconds,
     return result
 
 
+def compare_passed_arms(results):
+    """A failed/censored arm cannot support a numerical percentage comparison."""
+    comparisons = []
+    for item in results:
+        if item["mode"] != "candidate" or not item.get("passed"):
+            continue
+        baseline = next((other for other in results if other["mode"] == "baseline"
+                         and other.get("passed")
+                         and other["repetition"] == item["repetition"]
+                         and other["capacity_mbps_per_direction"] == item["capacity_mbps_per_direction"]
+                         and other["configured_rtt_ms"] == item["configured_rtt_ms"]), None)
+        if baseline is None:
+            continue
+        comparison = {"repetition": item["repetition"],
+                      "capacity_mbps_per_direction": item["capacity_mbps_per_direction"],
+                      "configured_rtt_ms": item["configured_rtt_ms"],
+                      "baseline_transport": baseline.get("transport", "webrtc"),
+                      "candidate_transport": item.get("transport", "webrtc")}
+        for metric in ("p50_ms", "p95_ms"):
+            before = baseline.get("loaded_tcp_request_response", {}).get(metric)
+            after = item.get("loaded_tcp_request_response", {}).get(metric)
+            if before and after is not None:
+                comparison[f"loaded_{metric}_change_percent"] = round((after / before - 1) * 100, 2)
+        for direction in ("upload", "download"):
+            before = baseline.get(direction, {}).get("mbps")
+            after = item.get(direction, {}).get("mbps")
+            if before and after is not None:
+                comparison[f"{direction}_throughput_change_percent"] = round((after / before - 1) * 100, 2)
+        comparisons.append(comparison)
+    return comparisons
+
+
 async def main(args):
-    # Python 3.12 Windows monotonic uses 15.625 ms GetTickCount64. asyncio may
-    # execute timers one clock resolution early, corrupting a 20/50 ms shaper.
-    # This isolated harness uses QPC for the loop and its own RTT measurements.
-    loop = asyncio.get_running_loop()
-    loop.time = time.perf_counter
-    loop._clock_resolution = time.get_clock_info("perf_counter").resolution
     results = []
     regimes = [(2, 40), (20, 100)]
     if args.regime:
         regimes = [regimes[args.regime - 1]]
-    report = {"schema": 2, "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    report = {"schema": 3, "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
               "production_core_sha256": hashlib.sha256(Path(core.__file__).read_bytes()).hexdigest(),
               "production_flow_sha256": hashlib.sha256(Path(core.__file__).with_name("flow.py").read_bytes()).hexdigest()
                   if Path(core.__file__).with_name("flow.py").exists() else None,
@@ -663,15 +765,21 @@ async def main(args):
               "candidate_budget_constant_available": hasattr(core, "PEER_SEND_BUDGET"),
               "candidate_initial_send_budget_override_bytes": args.candidate_window,
               "candidate_uses_production_defaults": args.candidate_window is None,
-              "benchmark_clock": {"implementation": time.get_clock_info("perf_counter").implementation,
-                                  "resolution_seconds": loop._clock_resolution},
-              "candidate_mechanism": "current production transport; explicit --candidate-window is an exploratory initial-budget override",
+              "benchmark_clock": event_loop_metadata(),
+              "candidate_transport": args.candidate_transport,
+              "candidate_mechanism": (f"current production {args.candidate_transport} backend; production sender/admission; "
+                                      "explicit --candidate-window is an exploratory initial-budget override"),
               "baseline": args.baseline,
+              "baseline_transport": "webrtc",
               "baseline_mechanism": ("published 0.2.2 sender, DeliveryWindow and transport constants; other connection and receive code shared with candidate"
-                                     if args.baseline == "0.2.2" else "frozen original _read with 256 KiB per-stream receiver credit"),
+                                     if args.baseline == "0.2.2" else
+                                     "published 0.2.4 sender, DeliveryWindow, SendBuffer and constants verified against revision 3f9f0f4; WebRTC backend"
+                                     if args.baseline == "0.2.4" else
+                                     "frozen original _read with 256 KiB per-stream receiver credit"),
               "baseline_snapshot": {**baseline_022.SOURCE,
                                     "snapshot_file_sha256": hashlib.sha256(Path(baseline_022.__file__).read_bytes()).hexdigest()}
-                                   if args.baseline == "0.2.2" else None,
+                                   if args.baseline == "0.2.2" else
+                                   dict(BASELINE_024_SOURCE) if args.baseline == "0.2.4" else None,
               "shaping": {"model": "FIFO serialization with independent full-duplex capacity per selected ICE UDP transport; Bernoulli loss; independent extra propagation jitter",
                           "accounted_bytes": "UDP payload bytes; excludes IP/UDP headers",
                           "fixed_delay_per_direction": "configured_rtt_ms / 2",
@@ -681,11 +789,12 @@ async def main(args):
                           "seed": args.seed,
                           "seed_model": "Python random.Random; reset each arm; transport seed is base seed plus zero-based creation ordinal",
                           "queue_limit_bytes": None, "queue_drops": 0,
-                          "installed_after": "authenticated ICE/DTLS/SCTP connection setup",
+                          "installed_after": "authenticated ICE and TLS/QUIC or DTLS/SCTP connection setup, according to the arm backend",
                           "regimes": [{"mbps_per_direction": mbps, "rtt_ms": rtt} for mbps, rtt in regimes]},
               "latency_sample_policy": "All sent probes are counted; summaries contain completed replies, including replies during a 3 s drain. Missing replies are reported and fail the arm.",
               "pending_data_bytes_meaning": "reserved or awaiting application delivery ACK; may include bytes still waiting for send-buffer admission, so it is not a measure of unsent transport queue bytes",
               "cleanup_policy": "Measurements are checkpointed before cleanup. Listeners stop accepting, fixture writers abort, peers close before listener waits, and every cleanup await has a 3 s bound.",
+              "comparison_policy": "Percentage comparisons require both arms to pass; failed, censored or incomplete measurements are excluded.",
               "arms": results}
     output = Path(args.output).resolve()
     output_lock = threading.Lock()
@@ -708,32 +817,10 @@ async def main(args):
             for mode in modes:
                 results.append(await run_arm(mode, mbps, rtt_ms, args.candidate_window, repetition,
                                              args.max_seconds, args.bulk_bytes, args.baseline,
-                                             args.loss_percent, args.jitter_ms, args.seed, checkpoint))
+                                             args.loss_percent, args.jitter_ms, args.seed, checkpoint,
+                                             args.candidate_transport))
                 report["all_passed"] = all(item["passed"] for item in results)
-                comparisons = []
-                for item in results:
-                    if item["mode"] != "candidate":
-                        continue
-                    baseline = next((other for other in results if other["mode"] == "baseline"
-                                     and other["repetition"] == item["repetition"]
-                                     and other["capacity_mbps_per_direction"] == item["capacity_mbps_per_direction"]), None)
-                    if baseline is None:
-                        continue
-                    comparison = {"repetition": item["repetition"],
-                                  "capacity_mbps_per_direction": item["capacity_mbps_per_direction"],
-                                  "configured_rtt_ms": item["configured_rtt_ms"]}
-                    for metric in ("p50_ms", "p95_ms"):
-                        before = baseline.get("loaded_tcp_request_response", {}).get(metric)
-                        after = item.get("loaded_tcp_request_response", {}).get(metric)
-                        if before and after is not None:
-                            comparison[f"loaded_{metric}_change_percent"] = round((after / before - 1) * 100, 2)
-                    for direction in ("upload", "download"):
-                        before = baseline.get(direction, {}).get("mbps")
-                        after = item.get(direction, {}).get("mbps")
-                        if before and after is not None:
-                            comparison[f"{direction}_throughput_change_percent"] = round((after / before - 1) * 100, 2)
-                    comparisons.append(comparison)
-                report["comparisons"] = comparisons
+                report["comparisons"] = compare_passed_arms(results)
                 save_report(report)
     return 0 if report.get("all_passed") else 1
 
@@ -752,8 +839,10 @@ def build_parser():
         return number
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", choices=("legacy", "0.2.2"), default="legacy",
+    parser.add_argument("--baseline", choices=("legacy", "0.2.2", "0.2.4"), default="legacy",
                         help="Frozen comparison transport; default preserves the original pre-0.2.2 sender")
+    parser.add_argument("--candidate-transport", choices=("webrtc", "quic"), default="webrtc",
+                        help="Candidate backend only; every baseline remains WebRTC")
     parser.add_argument("--candidate-window", type=int, default=None,
                         help="Exploratory override only; omission executes production's exact initial budget")
     parser.add_argument("--repetitions", type=int, default=1)
@@ -774,6 +863,5 @@ def build_parser():
 if __name__ == "__main__":
     arguments = build_parser().parse_args()
     logging.basicConfig(level=logging.WARNING)
-    if os.name == "nt":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    raise SystemExit(asyncio.run(main(arguments)))
+    with asyncio.Runner(loop_factory=NetworkEventLoop) as runner:
+        raise SystemExit(runner.run(main(arguments)))

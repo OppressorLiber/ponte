@@ -8,11 +8,19 @@ Baixe **Ponte.exe** na [versão mais recente](https://github.com/OppressorLiber/
 
 1. O anfitrião abre seu mundo e escolhe **Abrir para LAN** no Minecraft.
 2. No Ponte, informa a porta exibida no chat e cria um convite.
-3. O amigo abre o Ponte, informa seu nome e pede entrada com o convite.
+3. O amigo abre o Ponte, informa seu nome, escolhe QUIC e pede entrada com o convite.
 4. O anfitrião aprova a primeira solicitação e pode confiar naquele computador para liberar as próximas entradas automaticamente.
 5. O amigo copia o endereço local e usa **Multijogador → Conexão direta → colar endereço** no Minecraft.
 
-Mantenha o jogo e o Ponte abertos durante a partida. Os jogadores precisam usar versões e modpacks compatíveis entre si. O túnel transporta uma porta TCP do jogo; mods que usam portas adicionais podem exigir suporte próprio. Esta ferramenta não altera saves, mods, launcher ou contas.
+Mantenha o jogo e o Ponte abertos durante a partida. Os jogadores precisam usar versões e modpacks compatíveis entre si. A conexão principal transporta a porta TCP do jogo. O anfitrião pode cadastrar até oito serviços TCP/UDP adicionais; o uso por um mod depende da configuração de portas e endereços desse mod. Esta ferramenta não altera saves, mods, launcher ou contas.
+
+## QUIC e portas TCP/UDP — 0.3.0
+
+A conexão QUIC usa TLS 1.3 e o caminho UDP direto selecionado por ICE/STUN. Cada conexão TCP tem seu próprio stream confiável e ordenado; datagramas UDP usam QUIC DATAGRAM, sem retransmissão da aplicação. Os dois certificados efêmeros são verificados contra os fingerprints da negociação, e o certificado do convidado fica vinculado à assinatura de identidade do computador. Aprovação, confiança, remoção e renovação de convite continuam sendo aplicadas.
+
+Em **Portas adicionais**, o anfitrião escolhe serviços TCP/UDP em seu computador e as portas locais preferidas dos convidados. O valor zero permite escolher uma porta livre. Os destinos e listeners ficam restritos a `127.0.0.1`; o convidado não pode abrir destinos fora da lista autorizada. Os endereços efetivamente abertos aparecem na sessão. O preset **Voz · UDP 24454** facilita cadastrar uma porta comum; a porta real e a compatibilidade do mod precisam ser conferidas.
+
+O convidado pode escolher **WebRTC (compatível)** para entrar em versões anteriores do Ponte. Esse modo continua transportando a porta principal; as portas adicionais exigem QUIC. O anfitrião atualizado pode receber os dois transportes, sem downgrade silencioso. Consulte [QUIC e portas adicionais](docs/quic-portas.md).
 
 ## Controle da sala — 0.2.4
 
@@ -22,7 +30,7 @@ A confiança é verificada por uma chave Ed25519 persistente do computador do co
 
 **Remover** encerra a conexão daquela pessoa e retira a confiança do computador. Para voltar, ela precisa pedir entrada e receber uma nova aprovação. **Renovar convite** invalida o convite anterior para novas entradas e mantém os participantes já conectados; solicitações e negociações ainda incompletas são canceladas. Se o serviço não conseguir preparar o novo convite, o anterior continua funcionando.
 
-Atualize os dois PCs para receber os novos estados de espera. Veja [Controle da sala](docs/salas.md). A integração automática por mod Forge foi estudada e está descrita em [Mod Forge](docs/mod-forge.md); o mod ainda não faz parte desta versão.
+Atualize os dois PCs para receber os novos estados de espera. Veja [Controle da sala](docs/salas.md). O Ponte permanece como aplicativo externo ao Minecraft.
 
 ## Atualizações
 
@@ -76,7 +84,7 @@ Para reproduzir: `python qa_transport.py --repetitions 2 --bulk-bytes 1000000 --
 
 ## Como a conexão funciona
 
-WebRTC DataChannels confiáveis e ordenados transportam os bytes do TCP com criptografia DTLS. ICE/STUN tentam estabelecer o caminho direto, sem abrir portas manualmente no roteador. Não há TURN ou retransmissão da partida. Algumas combinações de NAT/firewall podem impedir a conexão direta.
+QUIC usa streams confiáveis e ordenados para TCP, DATAGRAM para UDP e criptografia TLS 1.3. O modo de compatibilidade usa WebRTC DataChannels e DTLS. ICE/STUN tentam estabelecer o caminho direto, sem abrir portas manualmente no roteador. Não há TURN ou retransmissão da partida. Algumas combinações de NAT/firewall podem impedir a conexão direta.
 
 O encontro inicial usa [ntfy.sh](https://ntfy.sh), somente para sinalização comprimida e criptografada ponta a ponta. Convites contêm um segredo aleatório de 256 bits; tópicos derivam de HMAC, e mensagens usam HKDF + ChaCha20Poly1305, com proteção contra repetição. O provedor vê metadados de HTTP e tópicos opacos; os dados da partida não passam por ele. O serviço possui cotas e disponibilidade próprias.
 

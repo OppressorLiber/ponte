@@ -21,6 +21,8 @@ from .flow import DeliveryWindow
 from .send_buffer import SendBuffer
 from .rtc import RoomPeerConnection as RTCPeerConnection
 from .identity import Identity, TrustStore, verify_offer
+from .quic_transport import QuicPeerConnection, is_quic_description, validate_description
+from .ports import UdpForwarder, normalize_ports
 
 LOG = logging.getLogger(__name__)
 CHUNK = 16384
@@ -48,6 +50,10 @@ def safe_name(name: str) -> str:
 
 
 def admission_description(sdp):
+    if is_quic_description(sdp):
+        if validate_description(sdp)["role"] != "client":
+            raise ValueError("Oferta QUIC inválida.")
+        return sdp
     sdp = direct_description(sdp)
     try:
         description = SessionDescription.parse(sdp)
@@ -255,10 +261,14 @@ class StreamBridge:
 
 
 class TunnelPeer:
-    def __init__(self, owner, peer_id, name):
+    def __init__(self, owner, peer_id, name, *, transport=None):
         self.owner, self.peer_id, self.name = owner, peer_id, safe_name(name)
-        configuration = RTCConfiguration(iceServers=[RTCIceServer(urls=STUN)] if owner.stun else [])
-        self.pc = RTCPeerConnection(configuration)
+        self.transport = transport or getattr(owner, "transport", "webrtc")
+        if self.transport == "quic":
+            self.pc = QuicPeerConnection(stun_server=("stun.cloudflare.com", 3478) if owner.stun else None)
+        else:
+            configuration = RTCConfiguration(iceServers=[RTCIceServer(urls=STUN)] if owner.stun else [])
+            self.pc = RTCPeerConnection(configuration)
         self.control = None
         self.streams = set()
         self.delivery = DeliveryWindow(PEER_SEND_BUDGET, quantum=SEND_CHUNK)
@@ -273,20 +283,30 @@ class TunnelPeer:
         self.negotiation_task = None
         self.public_key = None
         self.fingerprint = ""
+        self.port_mappings = []
+        self.extra_servers = []
+        self.udp = None
+        self._close_task = None
         self.pc.on("datachannel", self._datachannel)
         self.pc.on("connectionstatechange", self._state)
+        if self.transport == "quic":
+            self.pc.on("datagram", self._datagram)
 
     def notify(self, state):
         self.rtt_ms = self.latency.latest()
         stats = self.latency.diagnostics()
         self.owner.emit({"type": "peer", "peer_id": self.peer_id, "name": self.name,
                          "state": state, "rtt_ms": self.rtt_ms, "route": self.route(),
+                         "transport": self.transport,
+                         "transport_name": "QUIC / TLS 1.3" if self.transport == "quic" else "WebRTC / SCTP",
                          "fingerprint": self.fingerprint, "can_trust": bool(self.public_key),
                          "trusted": self.owner._is_trusted(self.public_key, self.fingerprint),
                          "rtt_p50_ms": stats["p50_ms"], "rtt_p95_ms": stats["p95_ms"],
                          "rtt_sample_age": stats["sample_age_seconds"]})
 
     def route(self):
+        if self.transport == "quic":
+            return self.pc.selected_route()
         try:
             connection = self.pc.sctp.transport.transport._connection
             pair = next(iter(connection._nominated.values()))
@@ -315,13 +335,35 @@ class TunnelPeer:
             return
         if channel.label == "control" and self.control is None:
             self._control(channel)
-        elif (self.owner.role == "host" and re.fullmatch(r"tcp:[a-f0-9]{32}", channel.label)
-              and self.ready.is_set() and len(self.streams) < MAX_STREAMS):
+        elif (self.owner.role == "host" and self.ready.is_set() and len(self.streams) < MAX_STREAMS
+              and (match := re.fullmatch(r"tcp:[a-f0-9]{32}(?::(p[1-8]))?", channel.label))):
+            mapping_id = match[1]
+            target = self.owner.host_port
+            if mapping_id:
+                mapping = next((p for p in self.port_mappings
+                                if p["id"] == mapping_id and p["protocol"] == "tcp"), None)
+                if self.transport != "quic" or mapping is None:
+                    channel.close()
+                    return
+                target = mapping["host_port"]
             bridge = StreamBridge(self, channel)
             self.streams.add(bridge)
-            bridge.task = asyncio.create_task(bridge.run(self.owner.host_port))
+            bridge.task = asyncio.create_task(bridge.run(target))
         else:
             channel.close()
+
+    def send_datagram(self, data):
+        if self.closed or self.owner.stopping or not self.ready.is_set() or self.transport != "quic":
+            return False
+        return self.pc.send_datagram(data)
+
+    def _datagram(self, data):
+        if self.udp and not self.closed and not self.owner.stopping and self.ready.is_set():
+            self.udp.handle_datagram(data)
+
+    def _udp_bytes(self, *, sent=0, received=0):
+        self.owner.sent += sent
+        self.owner.received += received
 
     def _control(self, channel):
         self.control = channel
@@ -370,15 +412,31 @@ class TunnelPeer:
 
     async def offer(self):
         self._control(self.pc.createDataChannel("control", ordered=True))
+        if self.transport == "quic":
+            return await self.pc.offer()
         await asyncio.wait_for(self.pc.setLocalDescription(await self.pc.createOffer()), 18)
         return direct_description(self.pc.localDescription.sdp)
 
     async def answer(self, sdp):
+        if self.transport == "quic":
+            self.port_mappings = list(self.owner.extra_ports)
+            self.pc.extensions = {"ports": self.port_mappings}
+            self.udp = UdpForwarder(self, True, self.port_mappings, on_bytes=self._udp_bytes)
+            return await self.pc.answer(sdp)
         await self.pc.setRemoteDescription(RTCSessionDescription(direct_description(sdp), "offer"))
         await asyncio.wait_for(self.pc.setLocalDescription(await self.pc.createAnswer()), 18)
         return direct_description(self.pc.localDescription.sdp)
 
     async def accept_answer(self, sdp):
+        if self.transport == "quic":
+            if not is_quic_description(sdp):
+                raise ValueError("A resposta não corresponde ao transporte QUIC escolhido.")
+            description = validate_description(sdp)
+            self.port_mappings = normalize_ports(description.get("extensions", {}).get("ports", []))
+            await self.pc.accept_answer(sdp)
+            return
+        if is_quic_description(sdp):
+            raise ValueError("A resposta não corresponde ao transporte escolhido.")
         await self.pc.setRemoteDescription(RTCSessionDescription(direct_description(sdp), "answer"))
 
     async def wait_connected(self):
@@ -400,23 +458,28 @@ class TunnelPeer:
                 asyncio.create_task(self.owner.stop())
             await self.close()
 
-    async def accept_tcp(self, reader, writer):
+    async def accept_tcp(self, reader, writer, mapping_id=None):
         if self.closed or len(self.streams) >= MAX_STREAMS:
             writer.close()
             return
-        channel = self.pc.createDataChannel("tcp:" + uuid.uuid4().hex, ordered=True)
+        label = "tcp:" + uuid.uuid4().hex + (":" + mapping_id if mapping_id else "")
+        channel = self.pc.createDataChannel(label, ordered=True)
         bridge = StreamBridge(self, channel, reader, writer)
         self.streams.add(bridge)
         bridge.task = asyncio.current_task()
         await bridge.run()
 
     async def close(self):
-        if self.closed:
-            closing = getattr(self.pc, "_room_close_task", None)
-            if closing is not None:
-                await asyncio.shield(closing)
-            return
-        self.closed = True
+        if self._close_task is None:
+            self.closed = True
+            self._close_task = asyncio.create_task(self._close(asyncio.current_task()))
+        await asyncio.shield(self._close_task)
+
+    async def _close(self, initiator):
+        for server in self.extra_servers:
+            server.close()
+        if self.udp:
+            await self.udp.close()
         for stream in list(self.streams):
             if stream.writer:
                 stream.writer.transport.abort()
@@ -424,9 +487,12 @@ class TunnelPeer:
         self.delivery.close()
         self.send_buffer.close()
         for task in (self.ping_task, self.connect_task, self.negotiation_task):
-            if task and task is not asyncio.current_task():
+            if task and task is not initiator and task is not asyncio.current_task():
                 task.cancel()
         await self.pc.close()
+        for server in self.extra_servers:
+            await server.wait_closed()
+        self.extra_servers.clear()
         if self.owner.peers.get(self.peer_id) is self:
             self.owner.peers.pop(self.peer_id, None)
         self.notify("disconnected")
@@ -434,8 +500,12 @@ class TunnelPeer:
 
 class TunnelService:
     def __init__(self, emit: Callable[[dict], None], *, endpoint="https://ntfy.sh", stun=True,
-                 identity=None, trust_store=None):
+                 identity=None, trust_store=None, transport="webrtc"):
+        if transport not in ("quic", "webrtc"):
+            raise ValueError("Transporte inválido. Escolha QUIC ou WebRTC.")
         self.emit = emit
+        self.transport = transport
+        self.extra_ports = []
         self.endpoint, self.stun = endpoint, stun
         self.bus = None
         self.peers = {}
@@ -518,11 +588,12 @@ class TunnelService:
         self.emit({"type": "status", "state": state,
                    "role": self.role, "message": message})
 
-    async def host(self, port, name="Meu mundo"):
+    async def host(self, port, name="Meu mundo", ports=None):
         if self.bus or self.starting:
             raise ValueError("Encerre a sala atual antes de abrir outra.")
         if not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError("Informe a porta mostrada pelo Minecraft ao abrir para LAN.")
+        mappings = normalize_ports(ports or [], game_port=port)
         generation = self._begin()
         try:
             _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), 3)
@@ -536,6 +607,7 @@ class TunnelService:
             raise ValueError("Não encontrei o jogo nessa porta. Abra o mundo para LAN e confira o número.") from exc
         self._check_start(generation)
         self.role, self.host_port, self.name = "host", port, safe_name(name)
+        self.extra_ports = mappings
         self.stopping = False
         self.sent = self.received = 0
         self.code = new_code()
@@ -552,20 +624,25 @@ class TunnelService:
                 await bus.close()
             raise
         self.starting = False
-        self.emit({"type": "room", "code": self.code, "name": self.name, "port": port})
+        self.emit({"type": "room", "code": self.code, "name": self.name, "port": port,
+                   "ports": list(self.extra_ports)})
         self.emit({"type": "status", "state": "hosting", "role": "host", "message": "Sala aberta. Convide seus amigos."})
         self.metrics_task = asyncio.create_task(self._metrics())
         self.loop_lag_task = asyncio.create_task(self._measure_loop())
         return self.code
 
-    async def join(self, code, port=0, name="Amigo"):
+    async def join(self, code, port=0, name="Amigo", *, transport=None):
         if self.bus or self.starting:
             raise ValueError("Encerre a conexão atual antes de entrar em outra sala.")
         normalized = normalize_code(code)
         if not isinstance(port, int) or not 0 <= port <= 65535:
             raise ValueError("Porta local inválida.")
+        selected = transport or self.transport
+        if selected not in ("quic", "webrtc"):
+            raise ValueError("Transporte inválido. Escolha QUIC ou WebRTC.")
         generation = self._begin()
         self.code, self.role, self.local_port = normalized, "guest", port
+        self.extra_ports = []
         self.stopping = False
         self.sent = self.received = 0
         self.signal_status("Encontrando o mundo…")
@@ -574,7 +651,7 @@ class TunnelService:
         try:
             await bus.start()
             self._check_start(generation)
-            peer = TunnelPeer(self, "host", "Anfitrião")
+            peer = TunnelPeer(self, "host", "Anfitrião", transport=selected)
             self.peers["host"] = peer
             peer.notify("connecting")
             sdp = await peer.offer()
@@ -738,7 +815,8 @@ class TunnelService:
                 self.trust_store.remember(request["public_key"], request["name"], timeout=0)
                 self.revoked_fingerprints.discard(request["fingerprint"])
             self._take_request(peer_id, "approved")
-            peer = TunnelPeer(self, peer_id, request["name"])
+            peer = TunnelPeer(self, peer_id, request["name"],
+                              transport="quic" if is_quic_description(request["sdp"]) else "webrtc")
             peer.public_key = request.get("public_key")
             peer.fingerprint = request.get("fingerprint", "")
             self.peers[peer_id] = peer
@@ -850,7 +928,7 @@ class TunnelService:
             self.retired_buses.discard(old_bus)
             self._check_start(generation + 1)
             self.emit({"type": "room", "code": self.code, "name": self.name,
-                       "port": self.host_port, "renewed": True})
+                       "port": self.host_port, "ports": list(self.extra_ports), "renewed": True})
             return self.code
         except BaseException:
             if candidate and self.bus is not candidate:
@@ -943,18 +1021,44 @@ class TunnelService:
         if self.stopping or peer.closed:
             return
         try:
-            server = await asyncio.start_server(peer.accept_tcp, "127.0.0.1", self.local_port)
+            server = await asyncio.start_server(peer.accept_tcp, "127.0.0.1", self.local_port,
+                                                start_serving=False)
             if self.stopping or peer.closed:
                 server.close()
                 await server.wait_closed()
                 return
             self.server = server
+            await server.start_serving()
             self.local_port = self.server.sockets[0].getsockname()[1]
-            self.emit({"type": "listening", "address": f"127.0.0.1:{self.local_port}"})
+            extra = []
+            for mapping in peer.port_mappings:
+                if mapping["protocol"] != "tcp":
+                    continue
+                async def accept(reader, writer, mapping_id=mapping["id"]):
+                    await peer.accept_tcp(reader, writer, mapping_id)
+                listener = await asyncio.start_server(accept, "127.0.0.1", mapping["local_port"],
+                                                      start_serving=False)
+                peer.extra_servers.append(listener)
+                if self.stopping or peer.closed:
+                    listener.close()
+                    raise asyncio.CancelledError()
+                await listener.start_serving()
+                bound_port = listener.sockets[0].getsockname()[1]
+                extra.append({**mapping, "local_port": bound_port,
+                              "local_address": f"127.0.0.1:{bound_port}"})
+            if peer.transport == "quic":
+                peer.udp = UdpForwarder(peer, False, peer.port_mappings, on_bytes=peer._udp_bytes)
+                extra.extend(await peer.udp.start_guest())
+            if self.stopping or peer.closed:
+                return
+            for record in extra:
+                record["local_address"] = f"127.0.0.1:{record['local_port']}"
+            self.emit({"type": "listening", "address": f"127.0.0.1:{self.local_port}",
+                       "ports": extra, "transport": peer.transport})
             self.emit({"type": "status", "state": "connected", "role": "guest",
                        "message": "Conexão direta pronta. Entre pelo Minecraft."})
         except OSError:
-            self.emit({"type": "error", "message": "A porta local está ocupada. Encerre a conexão e tente novamente."})
+            self.emit({"type": "error", "message": "Uma porta local está ocupada. Ajuste as portas adicionais ou encerre o programa que a utiliza."})
             asyncio.create_task(self.stop())
 
     async def _metrics(self):
@@ -1045,9 +1149,12 @@ class TunnelService:
                 "sent": self.sent, "received": self.received,
                 "event_loop_lag": summary(self.loop_lag),
                 "peers": [{"state": p.pc.connectionState, "route": p.route(), "rtt_ms": p.latency.latest(),
+                           "transport": p.transport,
                            "latency": p.latency.diagnostics(), "streams": len(p.streams),
                            "delivery": p.delivery.diagnostics(),
+                           "quic": p.pc.diagnostics() if p.transport == "quic" else None,
+                           "udp": p.udp.diagnostics() if p.udp else None,
                            "buffered_bytes": sum(s.channel.bufferedAmount for s in p.streams),
                            "receive_queued_bytes": sum(s.queued_bytes for s in p.streams),
                            "send_unacked_bytes": sum(WINDOW - s.credit for s in p.streams)} for p in self.peers.values()],
-                "transport": "WebRTC / ICE / STUN; sem TURN", "signaling": self.endpoint}
+                "transport": "QUIC ou WebRTC / ICE / STUN; sem TURN", "signaling": self.endpoint}

@@ -40,7 +40,7 @@ class Controller(QObject):
     def _run(self):
         self.loop = NetworkEventLoop()
         asyncio.set_event_loop(self.loop)
-        self.service = TunnelService(self._service_event)
+        self.service = TunnelService(self._service_event, transport="quic")
         self.updater = UpdateManager(self.event.emit, lambda:
                                      bool(self.service.bus or self.service.starting or self.service.server))
         self.started.set()
@@ -112,19 +112,19 @@ class Controller(QObject):
         future.add_done_callback(finished)
         return future
 
-    @Slot(int, str)
-    def host(self, port, name):
+    @Slot(int, str, list)
+    def host(self, port, name, ports=None):
         if self.updater.installing:
             return
         self.event.emit({"type": "status", "state": "connecting", "role": "host", "message": "Abrindo sua sala…"})
-        self._submit(self.service.host(port, name))
+        self._submit(self.service.host(port, name, ports))
 
-    @Slot(str, int, str)
-    def join(self, code, port=0, name="Amigo"):
+    @Slot(str, int, str, str)
+    def join(self, code, port=0, name="Amigo", transport="quic"):
         if self.updater.installing:
             return
         self.event.emit({"type": "status", "state": "connecting", "role": "guest", "message": "Encontrando o mundo…"})
-        self._submit(self.service.join(code, port, name))
+        self._submit(self.service.join(code, port, name, transport=transport))
 
     @Slot(str, bool)
     def approve(self, peer_id, remember=False):

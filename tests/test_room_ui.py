@@ -48,8 +48,8 @@ class FakeController(QObject):
     def forget_trusted(self, fingerprint):
         self._call("forget_trusted", fingerprint)
 
-    def join(self, code, port, name):
-        self._call("join", code, port, name)
+    def join(self, code, port, name, transport="quic"):
+        self._call("join", code, port, name, transport)
 
     def stop(self):
         self._call("stop")
@@ -304,7 +304,7 @@ class RoomUiTests(unittest.TestCase):
         self.window.invite_input.setPlainText("received-invite")
         self.window.guest_name.setText("  Nome de teste  ")
         self.window.join_button.click()
-        self.assertEqual(self.controller.calls, [("join", "received-invite", 0, "Nome de teste")])
+        self.assertEqual(self.controller.calls, [("join", "received-invite", 0, "Nome de teste", "quic")])
         self.assertEqual(self.window.settings.value("guest_name"), "Nome de teste")
         self.assertFalse(self.window.guest_name.isEnabled())
 
@@ -313,7 +313,7 @@ class RoomUiTests(unittest.TestCase):
         self.window.invite_input.setPlainText("received-invite")
         self.window.guest_name.clear()
         self.window.join_button.click()
-        self.assertEqual(self.controller.calls, [("join", "received-invite", 0, "Amigo")])
+        self.assertEqual(self.controller.calls, [("join", "received-invite", 0, "Amigo", "quic")])
 
     def test_compact_layout_keeps_rows_and_controls_readable(self):
         self.host()

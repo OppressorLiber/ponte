@@ -61,7 +61,8 @@ class LatencyTests(unittest.TestCase):
         service = TunnelService(lambda e: None)
         service.peers['test'] = SimpleNamespace(
             pc=SimpleNamespace(connectionState='connected'), route=lambda: 'host ↔ host',
-            rtt_ms=50, latency=samples, streams=set(), delivery=DeliveryWindow())
+            rtt_ms=50, latency=samples, streams=set(), delivery=DeliveryWindow(),
+            transport='webrtc', udp=None)
         self.assertIsNone(service.diagnostics()['peers'][0]['rtt_ms'])
 
 

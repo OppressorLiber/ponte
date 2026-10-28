@@ -1,6 +1,10 @@
 """Lightweight harness integrity/configuration checks; no sockets or benchmark."""
 import hashlib
+import asyncio
+import inspect
+import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -9,7 +13,11 @@ from pontelan import core
 import qa_baseline_022 as baseline_022
 from qa_transport import (build_parser, install_config, install_release_trace,
                           original_read, probe_series, sctp_diagnostics, ShapedUDP,
-                          series_extrema, source_fingerprint)
+                          series_extrema, source_fingerprint, arm_transport,
+                          connection_metadata, ice_protocols, compare_passed_arms,
+                          event_loop_metadata, main, run_arm, wait_for_listener,
+                          BASELINE_024_SOURCE)
+from pontelan.event_loop import NetworkEventLoop
 
 
 class BenchmarkConfigurationTests(unittest.TestCase):
@@ -21,6 +29,7 @@ class BenchmarkConfigurationTests(unittest.TestCase):
     def test_default_preserves_legacy_baseline_and_exact_candidate_defaults(self):
         args = build_parser().parse_args([])
         self.assertEqual(args.baseline, "legacy")
+        self.assertEqual(args.candidate_transport, "webrtc")
         self.assertIsNone(args.candidate_window)
         self.assertEqual((args.loss_percent, args.jitter_ms, args.seed), (0, 0, 20261024))
         before = self.configuration()
@@ -30,6 +39,82 @@ class BenchmarkConfigurationTests(unittest.TestCase):
         finally:
             restore()
         self.assertEqual(self.configuration(), before)
+
+    def test_024_baseline_preserves_verified_production_sender_and_admission(self):
+        args = build_parser().parse_args(["--baseline", "0.2.4", "--candidate-transport", "quic"])
+        self.assertEqual((args.baseline, args.candidate_transport), ("0.2.4", "quic"))
+        before = self.configuration()
+        restore = install_config("baseline", candidate_window=17, baseline="0.2.4")
+        try:
+            self.assertEqual(self.configuration(), before)
+            self.assertEqual(source_fingerprint(core.StreamBridge._read), BASELINE_024_SOURCE["stream_read_sha256"])
+            self.assertEqual(source_fingerprint(core.DeliveryWindow), BASELINE_024_SOURCE["delivery_window_sha256"])
+        finally:
+            restore()
+        self.assertEqual(self.configuration(), before)
+
+    def test_024_baseline_refuses_to_mislabel_changed_sender_as_published(self):
+        with patch.object(core.StreamBridge, "_read", original_read):
+            with self.assertRaisesRegex(ValueError, "no longer matches"):
+                install_config("baseline", baseline="0.2.4")
+
+    def test_candidate_transport_does_not_change_baseline_or_positional_api(self):
+        for baseline in ("legacy", "0.2.2", "0.2.4"):
+            with self.subTest(baseline=baseline):
+                self.assertEqual(arm_transport("baseline", "quic"), "webrtc")
+        self.assertEqual(arm_transport("candidate", "quic"), "quic")
+        self.assertEqual(arm_transport("candidate"), "webrtc")
+        parameters = tuple(inspect.signature(run_arm).parameters)
+        self.assertEqual(parameters[-2:], ("checkpoint", "candidate_transport"))
+        self.assertEqual(inspect.signature(run_arm).parameters["candidate_transport"].default, "webrtc")
+
+    def test_quic_metadata_and_native_counters_identify_tls_without_sctp(self):
+        protocol = object()
+        pc = SimpleNamespace(connectionState="connected", _ice=SimpleNamespace(_protocols=[protocol]),
+                             diagnostics=lambda: {"transport": "quic", "state": "connected",
+                                                  "congestion_window": 12000, "rtt_ms": 42.5,
+                                                  "unacked_bytes": 4000, "buffered_bytes": 200,
+                                                  "secret": "must-not-be-reported", "missing": None})
+        peer = SimpleNamespace(transport="quic", pc=pc)
+        values = sctp_diagnostics(peer)
+        self.assertEqual(values, {"transport": "quic", "congestion_window": 12000,
+                                  "rtt_ms": 42.5, "unacked_bytes": 4000, "buffered_bytes": 200})
+        self.assertEqual(ice_protocols(peer), [protocol])
+        metadata = connection_metadata(peer)
+        self.assertEqual(metadata["secure_transport_state"], "connected")
+        self.assertEqual(metadata["secure_transport_protocol"], "TLS 1.3")
+        self.assertEqual(metadata["dtls_state"], "connected")
+        self.assertEqual(metadata["sctp_state"], "not_applicable")
+        self.assertIn("TCP/ICE/TLS/QUIC", metadata["scope"])
+
+    def test_webrtc_metadata_and_ice_access_preserve_legacy_meaning(self):
+        protocol = object()
+        dtls = SimpleNamespace(state="connected", transport=SimpleNamespace(
+            _connection=SimpleNamespace(_protocols=[protocol])))
+        peer = SimpleNamespace(transport="webrtc", pc=SimpleNamespace(
+            sctp=SimpleNamespace(state="connected", transport=dtls)))
+        self.assertEqual(ice_protocols(peer), [protocol])
+        metadata = connection_metadata(peer)
+        self.assertEqual(metadata["dtls_state"], "connected")
+        self.assertEqual(metadata["sctp_state"], "connected")
+        self.assertEqual(metadata["secure_transport_protocol"], "DTLS")
+        self.assertIn("TCP/ICE/DTLS/SCTP", metadata["scope"])
+
+    def test_comparisons_require_two_passed_arms_in_the_same_regime(self):
+        baseline = {"mode": "baseline", "passed": True, "repetition": 1,
+                    "capacity_mbps_per_direction": 2, "configured_rtt_ms": 40,
+                    "transport": "webrtc", "upload": {"mbps": 1}, "download": {"mbps": 1},
+                    "loaded_tcp_request_response": {"p50_ms": 100, "p95_ms": 200}}
+        candidate = {**baseline, "mode": "candidate", "transport": "quic", "upload": {"mbps": 2},
+                     "loaded_tcp_request_response": {"p50_ms": 50, "p95_ms": 100}}
+        for before, after in (({**baseline, "passed": False}, candidate),
+                              (baseline, {**candidate, "passed": False}),
+                              (baseline, {**candidate, "configured_rtt_ms": 100})):
+            self.assertEqual(compare_passed_arms([before, after]), [])
+        comparison, = compare_passed_arms([baseline, candidate])
+        self.assertEqual(comparison["loaded_p50_ms_change_percent"], -50)
+        self.assertEqual(comparison["upload_throughput_change_percent"], 100)
+        self.assertEqual(comparison["candidate_transport"], "quic")
 
     def test_published_baseline_patches_sender_class_constants_and_constructor(self):
         before = self.configuration()
@@ -163,6 +248,60 @@ class BenchmarkConfigurationTests(unittest.TestCase):
              "phase": "loaded", "rtt_ms": 901.123},
             {"probe": 3, "sent_arm_seconds": 2.1, "sent_loaded_seconds": 1.1,
              "phase": "after_load", "rtt_ms": None}])
+
+
+class BenchmarkMetadataTests(unittest.TestCase):
+    def test_cli_runner_uses_production_network_clock_and_report_identifies_both_backends(self):
+        calls = []
+
+        async def fake_arm(*arguments):
+            calls.append(arguments)
+            mode, mbps, rtt_ms, _, repetition = arguments[:5]
+            return {"mode": mode, "repetition": repetition, "capacity_mbps_per_direction": mbps,
+                    "configured_rtt_ms": rtt_ms, "passed": True,
+                    "transport": arm_transport(mode, arguments[-1]),
+                    "loaded_tcp_request_response": {"p50_ms": 10, "p95_ms": 20},
+                    "upload": {"mbps": 1}, "download": {"mbps": 1}}
+
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "report.json"
+            args = build_parser().parse_args(["--baseline", "0.2.4", "--candidate-transport", "quic",
+                                             "--regime", "1", "--output", str(output)])
+            with patch("qa_transport.run_arm", side_effect=fake_arm):
+                with asyncio.Runner(loop_factory=NetworkEventLoop) as runner:
+                    self.assertEqual(runner.run(main(args)), 0)
+                    metadata = runner.run(self.clock_metadata())
+            report = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(arguments[-1] == "quic" for arguments in calls))
+        self.assertEqual(report["baseline_transport"], "webrtc")
+        self.assertEqual(report["candidate_transport"], "quic")
+        self.assertEqual(report["baseline_snapshot"], BASELINE_024_SOURCE)
+        self.assertTrue(report["candidate_uses_production_defaults"])
+        self.assertEqual(metadata["class"], "pontelan.event_loop.NetworkEventLoop")
+        self.assertEqual(metadata["time_function"], "NetworkEventLoop.time")
+        self.assertLess(metadata["resolution_seconds"], .001)
+        self.assertEqual(report["benchmark_clock"], metadata)
+
+    @staticmethod
+    async def clock_metadata():
+        return event_loop_metadata()
+
+
+class ListenerReadinessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_requested_nonzero_port_does_not_mean_listener_or_control_is_ready(self):
+        ready = asyncio.Event()
+        peer = SimpleNamespace(ready=ready, control=SimpleNamespace(readyState="connecting"))
+        service = SimpleNamespace(local_port=24454, server=None, peers={"host": peer})
+        events = []
+        waiting = asyncio.create_task(wait_for_listener(service, events))
+        await asyncio.sleep(0)
+        self.assertFalse(waiting.done())
+        service.server = object()
+        ready.set()
+        peer.control.readyState = "open"
+        events.append({"type": "listening"})
+        await asyncio.wait_for(waiting, 1)
 
 
 class UDPShaperTests(unittest.TestCase):

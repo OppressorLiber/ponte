@@ -9,6 +9,7 @@ softly elevated workspace. Native Qt controls provide keyboard accessibility.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from pontelan import __version__ as VERSION
 from pontelan.latency import format_rtt
+from pontelan.ports import normalize_ports
 
 COLORS = {
     "porcelain": "#F5F6F8", "paper": "#FFFFFF", "inset": "#F5F6F9",
@@ -294,6 +296,9 @@ class PeerRow(QFrame):
         self.state_label.style().polish(self.state_label)
         latency = peer.get("rtt_ms")
         route = peer.get("route")
+        transport = str(peer.get("transport") or "")
+        transport_name = str(peer.get("transport_name") or
+                             {"quic": "QUIC / TLS 1.3", "webrtc": "WebRTC / SCTP"}.get(transport, ""))
         if state == "connected":
             detail = "Conexão direta" if route else "Conexão estabelecida"
             if isinstance(latency, (int, float)):
@@ -303,12 +308,13 @@ class PeerRow(QFrame):
                       "disconnected": "O jogador saiu da sessão.",
                       "failed": "Não foi possível estabelecer uma rota."}.get(state, "")
         self.detail_label.setText(detail)
-        self.detail_label.setToolTip(f"Rota ICE: {route}" if route else "")
+        details = [transport_name] if transport_name else []
+        if route:
+            details.append(f"Rota direta: {route}")
         if state == "connected" and peer.get("rtt_p50_ms") is not None:
-            self.detail_label.setToolTip(
-                f"RTT do aplicativo · último {format_rtt(latency)}\n"
-                f"Mediana {format_rtt(peer.get('rtt_p50_ms'))} · p95 {format_rtt(peer.get('rtt_p95_ms'))}\n"
-                f"Rota ICE: {route}")
+            details.extend((f"RTT do aplicativo · último {format_rtt(latency)}",
+                            f"Mediana {format_rtt(peer.get('rtt_p50_ms'))} · p95 {format_rtt(peer.get('rtt_p95_ms'))}"))
+        self.detail_label.setToolTip("\n".join(details))
 
     def set_manageable(self, allowed: bool, busy: bool = False, action: str = ""):
         self.remove_button.setVisible(allowed and self._peer_state in ("connecting", "connected"))
@@ -347,6 +353,199 @@ class TrustedComputerRow(QFrame):
         self.forget_button.setText("Esquecendo…" if pending else "Esquecer")
 
 
+class AdditionalPortRow(QFrame):
+    """One loopback service; no arbitrary remote host can be configured."""
+
+    def __init__(self, port: dict, on_remove, parent=None):
+        super().__init__(parent)
+        self.port_id = str(port["id"])
+        self.setObjectName("additionalPortRow")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(8)
+        self.name_input = QLineEdit(str(port.get("name") or ""))
+        self.name_input.setMaxLength(40)
+        self.name_input.setPlaceholderText("Nome do serviço")
+        self.name_input.setAccessibleName("Nome da porta adicional")
+        self.name_input.setMinimumWidth(0)
+        layout.addWidget(self.name_input, 1)
+        self.protocol_combo = QComboBox()
+        self.protocol_combo.setFixedWidth(80)
+        self.protocol_combo.addItem("UDP", "udp")
+        self.protocol_combo.addItem("TCP", "tcp")
+        self.protocol_combo.setCurrentIndex(max(0, self.protocol_combo.findData(port.get("protocol", "udp"))))
+        self.protocol_combo.setAccessibleName("Protocolo da porta adicional")
+        layout.addWidget(self.protocol_combo)
+        self.host_port = self._port_input(1, "Porta do serviço neste computador")
+        self.host_port.setValue(int(port.get("host_port", 24454)))
+        self.local_port = self._port_input(0, "Porta preferida no computador do convidado; zero escolhe uma porta livre")
+        self.local_port.setValue(int(port.get("local_port", self.host_port.value())))
+        self.local_port.setToolTip("0 escolhe uma porta livre. O endereço usado aparece ao conectar.")
+        self._previous_host_port = self.host_port.value()
+        self.host_port.valueChanged.connect(self._follow_host_port)
+        layout.addWidget(self.host_port)
+        layout.addWidget(self.local_port)
+        self.remove_button = _button("×", "removeAdditionalPortButton", "quiet")
+        self.remove_button.setFixedWidth(30)
+        self.remove_button.setAccessibleName("Remover porta adicional")
+        self.remove_button.clicked.connect(lambda: on_remove(self))
+        layout.addWidget(self.remove_button)
+
+    @staticmethod
+    def _port_input(minimum: int, accessible_name: str) -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(minimum, 65535)
+        spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        spin.setGroupSeparatorShown(False)
+        spin.setFixedWidth(88)
+        spin.setAccessibleName(accessible_name)
+        return spin
+
+    def value(self) -> dict:
+        return {"id": self.port_id, "name": self.name_input.text().strip(),
+                "protocol": self.protocol_combo.currentData(),
+                "host_port": self.host_port.value(), "local_port": self.local_port.value()}
+
+    def _follow_host_port(self, value: int):
+        if self.local_port.value() == self._previous_host_port:
+            self.local_port.setValue(value)
+        self._previous_host_port = value
+
+
+class AdditionalPortsDialog(QDialog):
+    """Quiet optional configuration, separate from creating the LAN invitation.
+
+    Intent: friends choose only the few local services their world needs.
+    Hierarchy: service rows lead; the save action confirms a validated list.
+    Palette/depth/surfaces: existing porcelain, inset fields and river blue.
+    Typography/spacing: existing Segoe caption hierarchy, 4 px row rhythm.
+    """
+
+    def __init__(self, ports: list[dict], game_port: int, parent=None):
+        super().__init__(parent)
+        self.setObjectName("additionalPortsDialog")
+        self.setWindowTitle("Portas adicionais")
+        self.setMinimumSize(620, 380)
+        self.resize(660, 480)
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.game_port = game_port
+        self.ports: list[dict] = []
+        self.rows: list[AdditionalPortRow] = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+        layout.addWidget(_label("Portas adicionais", role="heading"))
+        layout.addWidget(_label("Encaminhe até 8 serviços TCP ou UDP deste computador. O mundo continua usando a porta LAN.", role="caption", wrap=True))
+        layout.addWidget(_label("Somente serviços em 127.0.0.1. No convidado, 0 escolhe uma porta livre.", role="caption", wrap=True))
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        header.addWidget(_label("Nome", role="label"), 1)
+        for title, width in (("Protocolo", 80), ("Anfitrião", 88), ("Convidado", 88)):
+            label = _label(title, role="label")
+            label.setFixedWidth(width)
+            header.addWidget(label)
+        header.addSpacing(30)
+        layout.addLayout(header)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.container = QWidget()
+        self.container.setObjectName("additionalPortsContainer")
+        self.rows_layout = QVBoxLayout(self.container)
+        self.rows_layout.setContentsMargins(0, 0, 4, 0)
+        self.rows_layout.setSpacing(0)
+        self.empty_label = _label("Nenhum serviço adicional. O convite compartilha o mundo normalmente.", role="caption", wrap=True)
+        self.rows_layout.addWidget(self.empty_label)
+        self.rows_layout.addStretch(1)
+        scroll.setWidget(self.container)
+        layout.addWidget(scroll, 1)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.add_button = _button("Adicionar porta", "addAdditionalPortButton")
+        self.add_button.clicked.connect(lambda: self.add_port())
+        actions.addWidget(self.add_button)
+        self.voice_button = _button("Voz · UDP 24454", "voicePortPresetButton", "quiet")
+        self.voice_button.setToolTip("Preenche uma porta UDP comum. O serviço de voz precisa aceitar conexão local; isso depende do mod e de sua configuração.")
+        self.voice_button.clicked.connect(lambda: self.add_port({"name": "Voz", "protocol": "udp", "host_port": 24454, "local_port": 24454}))
+        actions.addWidget(self.voice_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        layout.addWidget(_label("Voz e outros serviços dependem da configuração e compatibilidade do aplicativo ou mod.", role="caption", wrap=True))
+        self.notice = _label("", role="caption", wrap=True, name="portsNotice")
+        self.notice.hide()
+        layout.addWidget(self.notice)
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        cancel = _button("Cancelar", "cancelAdditionalPortsButton")
+        cancel.clicked.connect(self.reject)
+        self.save_button = _button("Salvar portas", "saveAdditionalPortsButton", "primary")
+        self.save_button.clicked.connect(self._save)
+        footer.addWidget(cancel)
+        footer.addWidget(self.save_button)
+        layout.addLayout(footer)
+        for port in ports:
+            self.add_port(port)
+        self._render_count()
+
+    def add_port(self, port: dict | None = None):
+        if len(self.rows) >= 8:
+            return
+        used = {row.port_id for row in self.rows}
+        mapping_id = next(f"p{number}" for number in range(1, 9) if f"p{number}" not in used)
+        value = {"id": mapping_id, "name": "Serviço", "protocol": "udp", "host_port": 24454, "local_port": 24454}
+        if port:
+            value.update(port)
+        row = AdditionalPortRow(value, self._remove_row)
+        self.rows.append(row)
+        self.rows_layout.insertWidget(self.rows_layout.count() - 1, row)
+        self.notice.hide()
+        self._render_count()
+
+    def _remove_row(self, row: AdditionalPortRow):
+        self.rows.remove(row)
+        self.rows_layout.removeWidget(row)
+        row.hide()
+        row.deleteLater()
+        self._render_count()
+
+    def _render_count(self):
+        self.empty_label.setVisible(not self.rows)
+        self.add_button.setEnabled(len(self.rows) < 8)
+        self.voice_button.setEnabled(len(self.rows) < 8)
+
+    def _save(self):
+        try:
+            self.ports = normalize_ports([row.value() for row in self.rows], game_port=self.game_port)
+        except (TypeError, ValueError) as exc:
+            self.notice.setText(str(exc))
+            self.notice.show()
+            return
+        self.accept()
+
+
+class ServiceAddressRow(QFrame):
+    def __init__(self, port: dict, address: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("serviceAddressRow")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 8, 0, 8)
+        layout.setSpacing(12)
+        text = QVBoxLayout()
+        text.setSpacing(3)
+        name = _NameLabel()
+        name.setText(str(port.get("name") or "Serviço"))
+        text.addWidget(name)
+        self.address_label = _label(f"{str(port.get('protocol') or '').upper()} · {address}", role="caption")
+        self.address_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        text.addWidget(self.address_label)
+        layout.addLayout(text, 1)
+        self.copy_button = _button("Copiar", "copyServiceAddressButton")
+        self.copy_button.setAccessibleName(f"Copiar endereço de {port.get('name') or 'serviço'}")
+        self.copy_button.clicked.connect(lambda: QApplication.clipboard().setText(address))
+        layout.addWidget(self.copy_button)
+
+
 class MainWindow(QMainWindow):
     """UI contract: controller.event is a Qt Signal(dict); actions are methods."""
 
@@ -370,6 +569,11 @@ class MainWindow(QMainWindow):
         self._trusted_rows: dict[str, TrustedComputerRow] = {}
         self._forgetting: set[str] = set()
         self._trusted_dialog: QDialog | None = None
+        self._configured_ports = self._load_port_settings()
+        self._active_ports: list[dict] = []
+        self._ports_dialog: AdditionalPortsDialog | None = None
+        self._addresses_dialog: QDialog | None = None
+        self._address_rows: list[ServiceAddressRow] = []
         self._animation = None
         self._update_state = ""
         self._update_version = ""
@@ -527,7 +731,7 @@ class MainWindow(QMainWindow):
 
         footer = QHBoxLayout()
         footer.setSpacing(10)
-        self.footer_label = _label("P2P direto · só a conexão do jogo", role="meta", name="footerConnection")
+        self.footer_label = _label("P2P direto · mundo e serviços escolhidos", role="meta", name="footerConnection")
         footer.addWidget(self.footer_label, 1)
         self.motion_toggle = QCheckBox("Reduzir animações")
         self.motion_toggle.setObjectName("reduceMotion")
@@ -552,8 +756,10 @@ class MainWindow(QMainWindow):
         QWidget.setTabOrder(self.world_name, self.port_input)
         QWidget.setTabOrder(self.port_input, self.world_combo)
         QWidget.setTabOrder(self.world_combo, self.scan_button)
-        QWidget.setTabOrder(self.scan_button, self.host_button)
-        QWidget.setTabOrder(self.guest_name, self.invite_input)
+        QWidget.setTabOrder(self.scan_button, self.extra_ports_button)
+        QWidget.setTabOrder(self.extra_ports_button, self.host_button)
+        QWidget.setTabOrder(self.guest_name, self.transport_combo)
+        QWidget.setTabOrder(self.transport_combo, self.invite_input)
         QWidget.setTabOrder(self.invite_input, self.join_button)
         QWidget.setTabOrder(self.copy_button, self.renew_invite_button)
 
@@ -619,6 +825,11 @@ class MainWindow(QMainWindow):
         layout.addSpacing(7)
         layout.addWidget(self.scan_hint)
         layout.addSpacing(8)
+        self.extra_ports_button = _button("Portas adicionais", "additionalPortsButton", "quiet")
+        self.extra_ports_button.setToolTip("Opcional: serviços TCP ou UDP em 127.0.0.1 neste computador")
+        self.extra_ports_button.clicked.connect(self._open_ports_configuration)
+        self._render_port_configuration()
+        layout.addWidget(self.extra_ports_button, 0, Qt.AlignmentFlag.AlignLeft)
         self.trusted_button = _button("Computadores de confiança (0)", "trustedComputersButton", "quiet")
         self.trusted_button.clicked.connect(self._open_trusted_computers)
         layout.addWidget(self.trusted_button, 0, Qt.AlignmentFlag.AlignLeft)
@@ -641,6 +852,10 @@ class MainWindow(QMainWindow):
         layout.addSpacing(5)
         layout.addWidget(_label("Peça o convite a quem abriu o mundo.", role="caption", wrap=True))
         layout.addSpacing(20)
+        fields = QHBoxLayout()
+        fields.setSpacing(12)
+        name_column = QVBoxLayout()
+        name_column.setSpacing(6)
         name_label = _label("Seu nome", role="label")
         self.guest_name = QLineEdit()
         self.guest_name.setObjectName("guestNameInput")
@@ -649,9 +864,25 @@ class MainWindow(QMainWindow):
         self.guest_name.setAccessibleName("Seu nome no pedido de entrada")
         self.guest_name.setToolTip("O anfitrião verá este nome ao aprovar sua entrada. Não verifica sua identidade no Minecraft.")
         name_label.setBuddy(self.guest_name)
-        layout.addWidget(name_label)
-        layout.addSpacing(6)
-        layout.addWidget(self.guest_name)
+        name_column.addWidget(name_label)
+        name_column.addWidget(self.guest_name)
+        fields.addLayout(name_column, 1)
+        transport_column = QVBoxLayout()
+        transport_column.setSpacing(6)
+        transport_label = _label("Conexão", role="label")
+        self.transport_combo = QComboBox()
+        self.transport_combo.setObjectName("transportCombo")
+        self.transport_combo.setAccessibleName("Protocolo de conexão com o anfitrião")
+        self.transport_combo.addItem("QUIC", "quic")
+        self.transport_combo.addItem("WebRTC · compatibilidade", "webrtc")
+        self.transport_combo.setMinimumWidth(0)
+        self.transport_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.transport_combo.setToolTip("QUIC para a Ponte atual. Escolha WebRTC para um anfitrião com uma versão anterior. Não há troca automática de protocolo.")
+        transport_label.setBuddy(self.transport_combo)
+        transport_column.addWidget(transport_label)
+        transport_column.addWidget(self.transport_combo)
+        fields.addLayout(transport_column, 1)
+        layout.addLayout(fields)
         layout.addSpacing(15)
         label = _label("Convite do anfitrião", role="label")
         layout.addWidget(label)
@@ -728,6 +959,10 @@ class MainWindow(QMainWindow):
         layout.addSpacing(8)
         self.connection_hint = _label("Envie este convite para quem vai jogar com você.", role="caption", wrap=True, name="connectionHint")
         layout.addWidget(self.connection_hint)
+        self.session_ports_button = _button("Portas adicionais", "sessionAdditionalPortsButton", "quiet")
+        self.session_ports_button.clicked.connect(self._open_service_addresses)
+        self.session_ports_button.hide()
+        layout.addWidget(self.session_ports_button, 0, Qt.AlignmentFlag.AlignLeft)
         self.renew_hint = _label("Ao renovar, o convite antigo deixa de valer. Quem já entrou continua.",
                                 role="caption", wrap=True, name="renewInviteHint")
         layout.addSpacing(4)
@@ -831,7 +1066,7 @@ class MainWindow(QMainWindow):
         note_layout.setContentsMargins(12, 11, 12, 11)
         note_layout.setSpacing(5)
         note_layout.addWidget(_label("Mesmo modpack, mesma versão.", role="label", wrap=True))
-        self.modpack_detail = _label("Cada um usa seus próprios arquivos. A Ponte compartilha só a conexão.", role="caption", wrap=True)
+        self.modpack_detail = _label("Cada um usa seus próprios arquivos. A Ponte encaminha as conexões escolhidas.", role="caption", wrap=True)
         note_layout.addWidget(self.modpack_detail)
         layout.addWidget(note)
         return self.guide
@@ -840,11 +1075,12 @@ class MainWindow(QMainWindow):
         c = COLORS
         self.setStyleSheet(f"""
             QMainWindow, QWidget#appRoot {{ background: {c['porcelain']}; color: {c['ink']}; }}
-            QDialog#trustedComputersDialog {{ background: {c['porcelain']}; color: {c['ink']}; }}
+            QDialog#trustedComputersDialog, QDialog#additionalPortsDialog,
+            QDialog#serviceAddressesDialog {{ background: {c['porcelain']}; color: {c['ink']}; }}
             QLabel {{ color: {c['ink']}; background: transparent; border: none; }}
             QLabel[role="caption"], QLabel[role="meta"] {{ color: {c['muted']}; }}
             QLabel#pageSubtitle {{ color: {c['secondary']}; }}
-            QLabel#trustNotice {{ color: {c['error']}; }}
+            QLabel#trustNotice, QLabel#portsNotice {{ color: {c['error']}; }}
             QFrame#workspace {{ background: {c['paper']}; border: 1px solid #EBEDF2; border-radius: 16px; }}
             QFrame#segmentedControl {{ background: #F0F2F6; border-radius: 9px; }}
             QPushButton {{ background: {c['paper']}; border: 1px solid {c['edge']};
@@ -889,7 +1125,8 @@ class MainWindow(QMainWindow):
                 selection-color: {c['ink']}; border: 1px solid {c['edge']}; padding: 4px; outline: none; }}
             QWidget#hostPage, QWidget#guestPage, QWidget#sessionPage, QStackedWidget,
             QScrollArea, QWidget#peersContainer, QWidget#admissionsSection,
-            QWidget#trustedComputersContainer, QWidget[role="page"] {{ background: transparent; border: none; }}
+            QWidget#trustedComputersContainer, QWidget#additionalPortsContainer,
+            QWidget#serviceAddressesContainer, QWidget[role="page"] {{ background: transparent; border: none; }}
             QLabel#statusBadge {{ padding: 6px 11px; background: #E9EDF3; border-radius: 12px; color: {c['secondary']}; }}
             QLabel#statusBadge[state="active"] {{ background: {c['green_wash']}; color: {c['green']}; }}
             QLabel#statusBadge[state="busy"] {{ background: {c['river_wash']}; color: {c['river']}; }}
@@ -972,6 +1209,8 @@ class MainWindow(QMainWindow):
         for control in (self.world_name, self.port_input, self.world_combo, self.host_button,
                         self.guest_name, self.invite_input, self.join_button):
             control.setEnabled(not busy)
+        self.extra_ports_button.setEnabled(not busy and not self._session)
+        self.transport_combo.setEnabled(not busy and not self._session)
         self.scan_button.setEnabled(not busy)
         self.host_button.setText("Criando convite…" if busy and self._role == "host" else "Criar convite")
         self.join_button.setText("Conectando…" if busy and self._role == "guest" else "Entrar no mundo")
@@ -1010,6 +1249,10 @@ class MainWindow(QMainWindow):
         self._session = False
         self._code = ""
         self._address = ""
+        self._active_ports.clear()
+        self._render_service_addresses()
+        if self._addresses_dialog is not None:
+            self._addresses_dialog.close()
         self._renewing_invite = False
         self._peer_actions.clear()
         self._clear_admissions()
@@ -1025,7 +1268,7 @@ class MainWindow(QMainWindow):
         self.room_meta.clear()
         self.latency_label.clear()
         self.peers_heading.setText("Na sessão")
-        self.footer_label.setText("P2P direto · só a conexão do jogo")
+        self.footer_label.setText("P2P direto · mundo e serviços escolhidos")
         self.segment.show()
         self._render_room_controls()
         self._set_busy(False)
@@ -1074,6 +1317,117 @@ class MainWindow(QMainWindow):
             self.connection_hint.setText("O endereço do Minecraft aparece depois que o anfitrião aprovar sua entrada.")
         else:
             self.connection_hint.setText("O endereço do Minecraft aparece quando a conexão estiver pronta.")
+        self._render_service_addresses()
+
+    def _load_port_settings(self) -> list[dict]:
+        try:
+            raw = json.loads(self.settings.value("extra_ports", "[]", type=str))
+            return normalize_ports(raw)
+        except (TypeError, ValueError):
+            return []
+
+    def _render_port_configuration(self):
+        count = len(self._configured_ports)
+        self.extra_ports_button.setText(f"Portas adicionais · {count}" if count else "Portas adicionais · opcional")
+
+    def _open_ports_configuration(self):
+        if self._busy or self._session or self._role != "host":
+            return
+        if self._ports_dialog is not None:
+            self._ports_dialog.deleteLater()
+        dialog = AdditionalPortsDialog(self._configured_ports, self.port_input.value(), self)
+        self._ports_dialog = dialog
+        dialog.accepted.connect(lambda: self._save_port_configuration(dialog))
+        dialog.open()
+
+    def _save_port_configuration(self, dialog: AdditionalPortsDialog):
+        if self._busy or self._session:
+            return
+        # Persist only the nonsecret service mapping, never room invitations.
+        self._configured_ports = [{key: port[key] for key in ("id", "name", "protocol", "host_port", "local_port")}
+                                  for port in dialog.ports]
+        self.settings.setValue("extra_ports", json.dumps(self._configured_ports, ensure_ascii=False))
+        self._render_port_configuration()
+
+    def _update_service_ports(self, ports, *, host: bool = False):
+        active = []
+        for port in ports if isinstance(ports, list) else []:
+            if not isinstance(port, dict):
+                continue
+            record = dict(port)
+            if host:
+                host_port = port.get("host_port")
+                if type(host_port) is not int or not 1 <= host_port <= 65535:
+                    continue
+                record["local_address"] = f"127.0.0.1:{host_port}"
+            address = record.get("local_address")
+            if not isinstance(address, str) or not address.startswith("127.0.0.1:"):
+                continue
+            try:
+                local_port = int(address.removeprefix("127.0.0.1:"))
+            except ValueError:
+                continue
+            if not 1 <= local_port <= 65535 or port.get("protocol") not in ("tcp", "udp"):
+                continue
+            active.append(record)
+        self._active_ports = active
+        self._render_service_addresses()
+
+    def _render_service_addresses(self):
+        ready = self._session and bool(self._active_ports) and (self._role == "host" or bool(self._address))
+        self.session_ports_button.setVisible(ready)
+        self.session_ports_button.setEnabled(ready and self.stop_button.isEnabled())
+        self.session_ports_button.setText(f"Portas adicionais · {len(self._active_ports)}")
+        if self._addresses_dialog is None:
+            return
+        for row in self._address_rows:
+            self.addresses_layout.removeWidget(row)
+            row.hide()
+            row.deleteLater()
+        self._address_rows.clear()
+        self.services_hint.setText(
+            "Destinos neste computador para esta sala. Mantenha cada serviço aberto."
+            if self._role == "host" else
+            "Endereços abertos pela Ponte neste computador. Use o protocolo indicado no aplicativo ou mod.")
+        for port in self._active_ports:
+            row = ServiceAddressRow(port, port["local_address"])
+            self._address_rows.append(row)
+            self.addresses_layout.insertWidget(self.addresses_layout.count() - 1, row)
+
+    def _open_service_addresses(self):
+        if not self._session or not self.session_ports_button.isEnabled() or not self._active_ports:
+            return
+        if self._addresses_dialog is None:
+            dialog = QDialog(self)
+            dialog.setObjectName("serviceAddressesDialog")
+            dialog.setWindowTitle("Portas adicionais da sala")
+            dialog.setMinimumSize(420, 270)
+            dialog.resize(490, 350)
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(24, 20, 24, 20)
+            layout.setSpacing(12)
+            layout.addWidget(_label("Portas adicionais da sala", role="heading"))
+            self.services_hint = _label("", role="caption", wrap=True)
+            layout.addWidget(self.services_hint)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            container = QWidget()
+            container.setObjectName("serviceAddressesContainer")
+            self.addresses_layout = QVBoxLayout(container)
+            self.addresses_layout.setContentsMargins(0, 0, 4, 0)
+            self.addresses_layout.setSpacing(0)
+            self.addresses_layout.addStretch(1)
+            scroll.setWidget(container)
+            layout.addWidget(scroll, 1)
+            layout.addWidget(_label("A conexão de voz depende do mod e de sua configuração.", role="caption", wrap=True))
+            close = _button("Fechar", "closeServiceAddressesButton")
+            close.clicked.connect(dialog.close)
+            layout.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+            self._addresses_dialog = dialog
+        self._render_service_addresses()
+        self._addresses_dialog.open()
 
     def _load_trusted_computers(self):
         try:
@@ -1258,11 +1612,18 @@ class MainWindow(QMainWindow):
         if self._busy or self._session:
             return
         self._hide_notice()
+        try:
+            ports = normalize_ports(self._configured_ports, game_port=self.port_input.value())
+        except (TypeError, ValueError) as exc:
+            self._show_notice(f"Confira as portas adicionais: {exc}", error=True)
+            return
         self._role = "host"
+        if self._ports_dialog is not None:
+            self._ports_dialog.close()
         self._set_busy(True)
         self._set_badge("Criando convite", "busy")
         try:
-            self.controller.host(int(self.port_input.value()), self.world_name.text().strip() or "Meu mundo")
+            self.controller.host(int(self.port_input.value()), self.world_name.text().strip() or "Meu mundo", ports)
         except Exception as exc:
             self._error(str(exc))
 
@@ -1281,7 +1642,7 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         self._set_badge("Conectando", "busy")
         try:
-            self.controller.join(code, 0, name)
+            self.controller.join(code, 0, name, self.transport_combo.currentData())
         except Exception as exc:
             self._error(str(exc))
 
@@ -1289,6 +1650,9 @@ class MainWindow(QMainWindow):
         if not self.stop_button.isEnabled():
             return
         self.stop_button.setEnabled(False)
+        self.session_ports_button.setEnabled(False)
+        if self._addresses_dialog is not None:
+            self._addresses_dialog.close()
         self._clear_admissions()
         self._render_room_controls()
         self._set_badge("Encerrando", "busy")
@@ -1518,6 +1882,8 @@ class MainWindow(QMainWindow):
             self.code_display.setPlainText(self._code)
             if not self._session:
                 self._begin_session()
+            if self._role == "host" and "ports" in event:
+                self._update_service_ports(event.get("ports"), host=True)
             if event.get("renewed"):
                 self._renewing_invite = False
                 self._show_notice("Convite renovado. O anterior deixou de valer; quem já entrou continua.", transient=True)
@@ -1533,7 +1899,12 @@ class MainWindow(QMainWindow):
             if self._role == "guest":
                 if not self._session:
                     self._begin_session()
+                if "ports" in event:
+                    self._update_service_ports(event.get("ports"))
                 self._render_guest_address()
+        elif kind == "ports":
+            if self._session and self.stop_button.isEnabled():
+                self._update_service_ports(event.get("ports"), host=self._role == "host")
         elif kind == "admission":
             peer_id = str(event.get("peer_id") or "")
             if not peer_id or self._role != "host" or not self._session or not self.stop_button.isEnabled():
@@ -1643,6 +2014,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self._trusted_dialog is not None:
             self._trusted_dialog.close()
+        if self._ports_dialog is not None:
+            self._ports_dialog.close()
+        if self._addresses_dialog is not None:
+            self._addresses_dialog.close()
         try:
             self.controller.stop()
         except Exception:
